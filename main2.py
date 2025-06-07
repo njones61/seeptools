@@ -3,7 +3,7 @@ from plot import plot_mesh, plot_solution
 
 # Load input
 model = Seep2D()
-model_data = read_seep2d_input("samples/s2con/s2con.s2d")
+model_data = read_seep2d_input("samples/s2unc/s2unc.s2d")
 
 # Populate model with input data
 model.coords = model_data["coords"]
@@ -14,10 +14,10 @@ model.element_materials = model_data["element_materials"]
 model.k1_by_mat = model_data["k1_by_mat"]
 model.k2_by_mat = model_data["k2_by_mat"]
 model.angle_by_mat = model_data["angle_by_mat"]
+model.kr0_by_mat = model_data["kr0_by_mat"]
+model.h0_by_mat = model_data["h0_by_mat"]
 model.unit_weight = model_data["unit_weight"]
 
-# Set problem type (0 = confined, 2 = unsaturated unconfined)
-model.iuntyp = 0  # or 2 for unconfined
 model.export_path = "solution.csv"
 
 # Run solver

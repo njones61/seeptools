@@ -93,83 +93,66 @@ class Seep2D:
                 self.dset_file = flname
                 print(f"DSET file: {flname}")
 
-
     def run_analysis(self):
-        
-        if self.iuntyp == 0:  # Confined SEEP2D problem
-            print("Solving confined SEEP2D problem (linear)...")
-            print("Number of fixed-head nodes:", np.sum(self.nbc == 1))
-            print("Number of exit face nodes:", np.sum(self.nbc == 2))
-            bcs = [(i, self.fx[i]) for i in range(len(self.nbc)) if self.nbc[i] == 1]
+        """
+        Unified SEEP2D analysis driver for both confined and unconfined flow.
+        """
+        is_unconfined = np.any(self.nbc == 2)
+        flow_type = "unconfined" if is_unconfined else "confined"
+        print(f"Solving {flow_type.upper()} SEEP2D problem...")
+        print("Number of fixed-head nodes:", np.sum(self.nbc == 1))
+        print("Number of exit face nodes:", np.sum(self.nbc == 2))
 
-            mat_ids = self.element_materials - 1
-            k1 = self.k1_by_mat[mat_ids]
-            k2 = self.k2_by_mat[mat_ids]
-            angle = self.angle_by_mat[mat_ids]
+        # Dirichlet BCs: fixed head (nbc == 1) and possibly exit face (nbc == 2)
+        bcs = [(i, self.fx[i]) for i in range(len(self.nbc)) if self.nbc[i] in (1, 2)]
 
+        # Material properties (per element)
+        mat_ids = self.element_materials - 1
+        k1 = self.k1_by_mat[mat_ids]
+        k2 = self.k2_by_mat[mat_ids]
+        angle = self.angle_by_mat[mat_ids]
+
+        # Solve for head, stiffness matrix A, and nodal flow vector q
+        if is_unconfined:
+            kr0 = float(self.kr0_by_mat[0])
+            h0 = float(self.h0_by_mat[0])
+            head, A, q = solve_unsaturated(
+                self.coords,
+                self.elements,
+                self.nbc,
+                self.fx,
+                kr0=kr0,
+                h0=h0,
+                k1_vals=k1,
+                k2_vals=k2,
+                angles=angle
+            )
+        else:
             head, A, q = solve_confined(self.coords, self.elements, bcs, k1, k2, angle)
-            gamma_w = self.unit_weight
-            pressure = gamma_w * (head - self.coords[:, 1])
-            velocity = compute_velocity(self.coords, self.elements, head, k1, k2, angle)
-            flowrate = q[(self.nbc == 1) & (q > 0)].sum()
 
-            # Solve for potential function Phi for flow lines
-            dirichlet_phi_bcs = create_flow_potential_bc(self.coords, self.elements, q)
-            phi = solve_flow_function(self.coords, self.elements, velocity, dirichlet_phi_bcs)
+        gamma_w = self.unit_weight
+        pressure = gamma_w * (head - self.coords[:, 1])
+        velocity = compute_velocity(self.coords, self.elements, head, k1, k2, angle)
+        flowrate = q[(self.nbc == 1) & (q > 0)].sum()
 
-            print(f"phi min: {np.min(phi):.3f}, max: {np.max(phi):.3f}")
+        # Solve for potential function φ for flow lines
+        dirichlet_phi_bcs = create_flow_potential_bc(self.coords, self.elements, q)
+        phi = solve_flow_function(self.coords, self.elements, velocity, dirichlet_phi_bcs)
 
-            self.solution = {
-                "head": head,
-                "pressure": pressure,
-                "velocity": velocity,
-                "q": q,
-                "phi": phi,
-                "flowrate": flowrate
-            }
+        print(f"phi min: {np.min(phi):.3f}, max: {np.max(phi):.3f}")
 
+        self.solution = {
+            "head": head,
+            "pressure": pressure,
+            "velocity": velocity,
+            "q": q,
+            "phi": phi,
+            "flowrate": flowrate
+        }
+
+        if hasattr(self, "export_path"):
             export_solution_csv(self.export_path, self.coords, head, pressure, velocity, q, phi, flowrate)
 
-            return
-
-        elif self.iuntyp == 2:  # Unconfined SEEP2D problem
-            print("Solving unconfined SEEP2D problem using kr frontal function...")
-            print("Number of fixed-head nodes:", np.sum(self.nbc == 1))
-            print("Number of exit face nodes:", np.sum(self.nbc == 2))
-            bcs = [(i, self.fx[i]) for i in range(len(self.nbc)) if self.nbc[i] in (1, 2)]
-
-            mat_ids = self.element_materials - 1
-            k1 = self.k1_by_mat[mat_ids]
-            k2 = self.k2_by_mat[mat_ids]
-            angle = self.angle_by_mat[mat_ids]
-
-            h, pressure, velocity, q = solve_unsaturated(self.coords, self.elements, self.nbc, self.fx)
-            self.solution = {"head": h, "pressure": pressure, "velocity": velocity}
-            if hasattr(self, "export_path"):
-                export_solution_csv(self.export_path, self.coords, h, pressure, velocity)
-
-                print("Running seepage analysis...")
-
-            # Placeholder dummy results for demo purposes
-            n = self.coords.shape[0]
-            head = np.ones(n)
-            pressure = np.zeros(n)
-            velocity = np.zeros((n, 2))
-
-            flowrate = q[(self.nbc == 1) & (q > 0)].sum()
-
-            self.solution = {
-                "head": h,
-                "pressure": pressure,
-                "velocity": velocity,
-                "q": q,
-                "flowrate": flowrate
-            }
-
-            if hasattr(self, "coords") and hasattr(self, "export_path"):
-                export_solution_csv(self.export_path, self.coords, head, pressure, velocity, q, flowrate)
-
-            return
 
     def save_results(self, filename):
         print(f"Saving results to {filename}")
@@ -344,7 +327,7 @@ def load_solution_csv(filename):
     velocity = df[["vx", "vy"]].values
     return coords, head, pressure, velocity
 
-def solve_confined(coords, elements, dirichlet_bcs, k1_vals=None, k2_vals=None, angles=None):
+def solve_confined(coords, elements, dirichlet_bcs, k1_vals, k2_vals, angles=None):
     """
     FEM solver for confined seepage with anisotropic conductivity.
     Parameters:
@@ -365,8 +348,6 @@ def solve_confined(coords, elements, dirichlet_bcs, k1_vals=None, k2_vals=None, 
     A = lil_matrix((n_nodes, n_nodes))
     b = np.zeros(n_nodes)
 
-    scalar_k = np.isscalar(k1_vals)
-
     for idx, tri in enumerate(elements):
         i, j, k = tri
         xi, yi = coords[i]
@@ -382,14 +363,9 @@ def solve_confined(coords, elements, dirichlet_bcs, k1_vals=None, k2_vals=None, 
         grad = np.array([beta, gamma]) / (2 * area)
 
         # Get anisotropic conductivity
-        if scalar_k:
-            k1 = k1_vals
-            k2 = k2_vals
-            theta = angles
-        else:
-            k1 = k1_vals[idx]
-            k2 = k2_vals[idx]
-            theta = angles[idx]
+        k1 = k1_vals[idx]
+        k2 = k2_vals[idx]
+        theta = angles[idx]
 
         theta_rad = np.radians(theta)
         c, s = np.cos(theta_rad), np.sin(theta_rad)
@@ -417,10 +393,20 @@ def solve_confined(coords, elements, dirichlet_bcs, k1_vals=None, k2_vals=None, 
     return head, A, q
 
 def kr_frontal(p, kr0, h0):
-    """Compute relative conductivity using frontal function."""
-    import numpy as np
+    """
+    Computes relative permeability kr based on pressure head p.
+
+    Parameters:
+        p : ndarray of pressure head values
+        kr0 : minimum kr value (e.g., 0.1)
+        h0 : pressure head at which kr = kr0 (typically negative)
+
+    Returns:
+        kr : ndarray of kr values (same shape as p)
+    """
+    p = np.asarray(p)
     kr = np.ones_like(p)
-    mask1 = (p <= 0) & (p > h0)
+    mask1 = (p < 0) & (p > h0)
     mask2 = (p <= h0)
     kr[mask1] = kr0 + (1 - kr0) * p[mask1] / h0
     kr[mask2] = kr0
@@ -439,16 +425,17 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.1, h0=-1.0,
 
     n_nodes = coords.shape[0]
     y = coords[:, 1]
-    h = np.full(n_nodes, np.mean(fx[nbc == 1]) if np.any(nbc == 1) else 1.0)
-    bcs = [(i, fx[i]) for i in range(n_nodes) if nbc[i] in (1, 2)]
 
-    scalar_k = np.isscalar(k1_vals)
+    # Initial head guess (use mean of Dirichlet BCs or 1.0 if none)
+    h = np.full(n_nodes, np.mean(fx[nbc == 1]) if np.any(nbc == 1) else 1.0)
+
+    # Identify Dirichlet BCs: fixed head and exit face
+    bcs = [(i, fx[i]) for i in range(n_nodes) if nbc[i] in (1, 2)]
 
     for iteration in range(max_iter):
         A = lil_matrix((n_nodes, n_nodes))
         b = np.zeros(n_nodes)
-        p = h - y
-        kr = kr_frontal(p, kr0, h0)
+        p = h - y  # pressure head per node
 
         for idx, tri in enumerate(elements):
             i, j, k = tri
@@ -464,28 +451,28 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.1, h0=-1.0,
             gamma = np.array([xk - xj, xi - xk, xj - xi])
             grad = np.array([beta, gamma]) / (2 * area)
 
-            # Get anisotropic K matrix
-            if scalar_k:
-                k1 = k1_vals
-                k2 = k2_vals
-                theta = angles
-            else:
-                k1 = k1_vals[idx]
-                k2 = k2_vals[idx]
-                theta = angles[idx]
+            # Material properties for this element
+            k1 = k1_vals[idx]
+            k2 = k2_vals[idx]
+            theta = angles[idx]
 
             theta_rad = np.radians(theta)
             c, s = np.cos(theta_rad), np.sin(theta_rad)
             R = np.array([[c, s], [-s, c]])
             Kmat = R.T @ np.diag([k1, k2]) @ R
 
-            kr_elem = np.mean([kr[i], kr[j], kr[k]])
+            # Average pressure head for the triangle
+            p_avg = np.mean([p[i], p[j], p[k]])
+            kr_vals = kr_frontal(p[[i, j, k]], kr0, h0)
+            kr_elem = np.mean(kr_vals)
+
             ke = kr_elem * area * grad.T @ Kmat @ grad
 
             for a in range(3):
                 for b_ in range(3):
                     A[tri[a], tri[b_]] += ke[a, b_]
 
+        # Apply Dirichlet BCs
         for node, value in bcs:
             A[node, :] = 0
             A[node, node] = 1
@@ -496,8 +483,8 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.1, h0=-1.0,
             break
         h = h_new
 
-    A_full = A.copy()  # Save final assembled matrix before BCs applied
-
+    # Final solve for nodal flow vector q
+    A_full = A.copy()
     for node, value in bcs:
         A[node, :] = 0
         A[node, node] = 1
@@ -506,9 +493,7 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.1, h0=-1.0,
     h_final = spsolve(A.tocsr(), b)
     q = A_full.tocsr() @ h_final
 
-    pressure = h_final - y
-    velocity = np.zeros_like(coords)  # Placeholder
-    return h_final, pressure, velocity, q
+    return h_final, A, q
 
 def create_flow_potential_bc(coords, elements, q):
     """
