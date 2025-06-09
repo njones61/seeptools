@@ -4,6 +4,7 @@ from plot import plot_mesh, plot_solution
 # Load input
 model = Seep2D()
 model_data = read_seep2d_input("samples/s2unc/s2unc.s2d")
+#model_data = read_seep2d_input("samples/s2con/s2con.s2d")
 
 # Populate model with input data
 model.coords = model_data["coords"]
