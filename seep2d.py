@@ -417,7 +417,7 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.1, h0=-1.0,
                       k1_vals=1.0, k2_vals=1.0, angles=0.0,
                       max_iter=50, tol=1e-4):
     """
-    Iterative FEM solver for unsaturated flow using frontal kr function with anisotropic K.
+    Iterative FEM solver for unconfined flow using linear kr frontal function and anisotropic conductivity.
     """
     import numpy as np
     from scipy.sparse import lil_matrix
@@ -425,17 +425,21 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.1, h0=-1.0,
 
     n_nodes = coords.shape[0]
     y = coords[:, 1]
-
-    # Initial head guess (use mean of Dirichlet BCs or 1.0 if none)
     h = np.full(n_nodes, np.mean(fx[nbc == 1]) if np.any(nbc == 1) else 1.0)
 
-    # Identify Dirichlet BCs: fixed head and exit face
-    bcs = [(i, fx[i]) for i in range(n_nodes) if nbc[i] in (1, 2)]
+    # Initial BCs: fixed head (nbc == 1) + exit face (nbc == 2) as h = elevation
+    bcs = []
+    for i in range(n_nodes):
+        if nbc[i] == 1:
+            bcs.append((i, fx[i]))
+        elif nbc[i] == 2:
+            bcs.append((i, y[i]))
 
     for iteration in range(max_iter):
         A = lil_matrix((n_nodes, n_nodes))
         b = np.zeros(n_nodes)
-        p = h - y  # pressure head per node
+        p = h - y
+        kr_node = kr_frontal(p, kr0, h0)
 
         for idx, tri in enumerate(elements):
             i, j, k = tri
@@ -451,7 +455,6 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.1, h0=-1.0,
             gamma = np.array([xk - xj, xi - xk, xj - xi])
             grad = np.array([beta, gamma]) / (2 * area)
 
-            # Material properties for this element
             k1 = k1_vals[idx]
             k2 = k2_vals[idx]
             theta = angles[idx]
@@ -461,29 +464,38 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.1, h0=-1.0,
             R = np.array([[c, s], [-s, c]])
             Kmat = R.T @ np.diag([k1, k2]) @ R
 
-            # Average pressure head for the triangle
-            p_avg = np.mean([p[i], p[j], p[k]])
-            kr_vals = kr_frontal(p[[i, j, k]], kr0, h0)
-            kr_elem = np.mean(kr_vals)
-
-            ke = kr_elem * area * grad.T @ Kmat @ grad
+            kr_avg = np.mean([kr_node[i], kr_node[j], kr_node[k]])
+            ke = kr_avg * area * grad.T @ Kmat @ grad
 
             for a in range(3):
                 for b_ in range(3):
                     A[tri[a], tri[b_]] += ke[a, b_]
 
-        # Apply Dirichlet BCs
         for node, value in bcs:
             A[node, :] = 0
             A[node, node] = 1
             b[node] = value
 
         h_new = spsolve(A.tocsr(), b)
-        if np.max(np.abs(h_new - h)) < tol:
+
+        residual = np.max(np.abs(h_new - h))
+        print(f"Iteration {iteration}: residual = {residual:.6e}")
+        if residual < tol:
             break
         h = h_new
 
-    # Final solve for nodal flow vector q
+        # Update BCs: type 1 stays, type 2 is conditional on saturation
+        new_bcs = []
+        for i in range(n_nodes):
+            if nbc[i] == 1:
+                new_bcs.append((i, fx[i]))
+            elif nbc[i] == 2:
+                if h[i] >= y[i]:  # still wet
+                    new_bcs.append((i, y[i]))
+                # else: becomes no-flow (bc type 0)
+        bcs = new_bcs
+
+    # Final solve and nodal flow vector
     A_full = A.copy()
     for node, value in bcs:
         A[node, :] = 0
@@ -548,6 +560,12 @@ def create_flow_potential_bc(coords, elements, q):
             start_idx = (i + 1) % n
             break
     if start_idx is None:
+        # Just before the raise statement
+        print("Min q:", np.min(q))
+        print("Max q:", np.max(q))
+        print("q on boundary:")
+        for a, b in boundary_edges:
+            print(f"Edge ({a}, {b}): q[a]={q[a]:.3e}, q[b]={q[b]:.3e}")
         raise ValueError("Unable to find suitable start point with transition from nonzero to zero q")
 
     # Step 6: Assign φ = 0 to the starting node, then accumulate q
