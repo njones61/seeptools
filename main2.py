@@ -1,5 +1,6 @@
-from seep2d import Seep2D, read_seep2d_input
+from seep2d import Seep2D, read_seep2d_input, diagnose_exit_face
 from plot import plot_mesh, plot_solution
+import numpy as np
 
 # Load input
 model = Seep2D()
@@ -21,12 +22,59 @@ model.unit_weight = model_data["unit_weight"]
 
 model.export_path = "solution.csv"
 
+
+# Add these debug prints to main2.py after loading the model data
+
+print("\n=== Material Properties Debug ===")
+print(f"Number of materials: {len(model.k1_by_mat)}")
+for i, (k1, k2, angle, kr0, h0) in enumerate(zip(
+    model.k1_by_mat, model.k2_by_mat, model.angle_by_mat,
+    model.kr0_by_mat, model.h0_by_mat)):
+    print(f"Material {i+1}: k1={k1}, k2={k2}, angle={angle}, kr0={kr0}, h0={h0}")
+
+print("\n=== Boundary Conditions Debug ===")
+print(f"Total nodes: {len(model.nbc)}")
+print(f"Fixed head nodes (nbc=1): {np.sum(model.nbc == 1)}")
+print(f"Exit face nodes (nbc=2): {np.sum(model.nbc == 2)}")
+print(f"No-flow nodes (nbc=0): {np.sum(model.nbc == 0)}")
+
+# Check head values at boundaries
+fixed_heads = [(i, model.fx[i]) for i in range(len(model.nbc)) if model.nbc[i] == 1]
+print(f"\nFixed head values: min={min(h for _, h in fixed_heads):.3f}, max={max(h for _, h in fixed_heads):.3f}")
+
+exit_elevations = [(i, model.coords[i,1]) for i in range(len(model.nbc)) if model.nbc[i] == 2]
+if exit_elevations:
+    print(f"Exit face elevations: min={min(y for _, y in exit_elevations):.3f}, max={max(y for _, y in exit_elevations):.3f}")
+
+print("\n=== Element Materials Debug ===")
+unique_mats, counts = np.unique(model.element_materials, return_counts=True)
+for mat, count in zip(unique_mats, counts):
+    print(f"Material {mat}: {count} elements")
+
+# Check for any zero or negative conductivities
+k1_arr = model.k1_by_mat[model.element_materials - 1]
+k2_arr = model.k2_by_mat[model.element_materials - 1]
+if np.any(k1_arr <= 0) or np.any(k2_arr <= 0):
+    print("\nWARNING: Found zero or negative conductivities!")
+    print(f"k1 range: [{np.min(k1_arr)}, {np.max(k1_arr)}]")
+    print(f"k2 range: [{np.min(k2_arr)}, {np.max(k2_arr)}]")
+
+
 # Run solver
 model.run_analysis()
+
+
+diagnose_exit_face(model.coords, model.nbc, model.solution["head"],
+                   model.solution["q"], model.fx)
+
 
 # Plot mesh
 plot_mesh(model.coords, model.elements, model.element_materials,
           show_nodes=True, show_bc=True, nbc=model.nbc)
+
+
+
+
 
 # Plot solution
 plot_solution(model.coords,

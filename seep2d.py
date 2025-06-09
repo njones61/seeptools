@@ -114,17 +114,20 @@ class Seep2D:
 
         # Solve for head, stiffness matrix A, and nodal flow vector q
         if is_unconfined:
+            # Get kr0 and h0 values per element based on material
+            kr0_per_element = self.kr0_by_mat[mat_ids]
+            h0_per_element = self.h0_by_mat[mat_ids]
+
             head, A, q = solve_unsaturated(
-                self.coords,
-                self.elements,
-                self.nbc,
-                self.fx,
-                self.kr0_by_mat,
-                self.h0_by_mat,
-                self.element_materials,
-                k1,
-                k2,
-                angle,
+                coords=self.coords,
+                elements=self.elements,
+                nbc=self.nbc,
+                fx=self.fx,
+                kr0=kr0_per_element,
+                h0=h0_per_element,
+                k1_vals=k1,
+                k2_vals=k2,
+                angles=angle,
                 max_iter=150,
                 tol=1e-4
             )
@@ -394,174 +397,212 @@ def solve_confined(coords, elements, dirichlet_bcs, k1_vals, k2_vals, angles=Non
     return head, A, q
 
 
-def solve_unsaturated(coords, elements, nbc, fx, kr0_by_mat, h0_by_mat,
-                      element_materials, k1_vals, k2_vals, angles,
-                      max_iter=200, tol=5e-5):
+def solve_unsaturated(coords, elements, nbc, fx, kr0=0.001, h0=-1.0,
+                      k1_vals=1.0, k2_vals=1.0, angles=0.0,
+                      max_iter=150, tol=1e-4):
     """
-    Fixed iterative FEM solver for unconfined flow matching Fortran implementation.
+    Iterative FEM solver for unconfined flow using linear kr frontal function.
 
-    Key fixes:
-    1. Added adaptive relaxation factor
-    2. Calculate kr at element centroid (not nodes)
-    3. Use material-specific kr parameters
-    4. Proper boundary condition updating
+    This version includes:
+    - Adaptive relaxation factors
+    - Proper exit face boundary condition updates
+    - Element-wise kr computation
+    - Convergence monitoring with active node tracking
     """
     import numpy as np
-    from scipy.sparse import lil_matrix
+    from scipy.sparse import lil_matrix, csr_matrix
     from scipy.sparse.linalg import spsolve
 
     n_nodes = coords.shape[0]
     y = coords[:, 1]
 
-    # Better initial guess - use average of fixed head values
-    fixed_heads = fx[nbc == 1]
-    if len(fixed_heads) > 0:
-        h = np.full(n_nodes, np.mean(fixed_heads))
-    else:
-        h = np.full(n_nodes, np.max(y) + 1.0)
+    # Initialize heads
+    # For exit face nodes (nbc==2), start with h = elevation
+    # For fixed head nodes (nbc==1), use prescribed values
+    h = np.zeros(n_nodes)
+    for node_idx in range(n_nodes):
+        if nbc[node_idx] == 1:
+            h[node_idx] = fx[node_idx]
+        elif nbc[node_idx] == 2:
+            h[node_idx] = y[node_idx]
+        else:
+            # Initialize other nodes to average of fixed heads
+            fixed_heads = fx[nbc == 1]
+            h[node_idx] = np.mean(fixed_heads) if len(fixed_heads) > 0 else np.mean(y)
 
-    # Initial BCs: fixed head (nbc == 1) + exit face (nbc == 2) as h = elevation
-    def get_current_bcs():
-        bcs = []
-        for i in range(n_nodes):
-            if nbc[i] == 1:  # Fixed head
-                bcs.append((i, fx[i]))
-            elif nbc[i] == 2:  # Exit face
-                if h[i] >= y[i]:  # Still saturated
-                    bcs.append((i, y[i]))
-                # else: becomes no-flow (not included in bcs)
-        return bcs
+    # Track which exit face nodes are active (saturated)
+    exit_face_active = np.ones(n_nodes, dtype=bool)
+    exit_face_active[nbc != 2] = False
 
-    print(f"Starting unsaturated flow iteration...")
+    # Store previous iteration values
+    h_last = h.copy()
 
-    for iteration in range(max_iter):
+    # Get material properties per element
+    if np.isscalar(kr0):
+        kr0 = np.full(len(elements), kr0)
+    if np.isscalar(h0):
+        h0 = np.full(len(elements), h0)
+
+    print("Starting unsaturated flow iteration...")
+
+    for iteration in range(1, max_iter + 1):
+        # Build global stiffness matrix
         A = lil_matrix((n_nodes, n_nodes))
         b = np.zeros(n_nodes)
 
-        # Build stiffness matrix
+        # Compute pressure head at nodes
+        p_nodes = h - y
+
+        # Element assembly with element-wise kr computation
         for idx, tri in enumerate(elements):
             i, j, k = tri
             xi, yi = coords[i]
             xj, yj = coords[j]
             xk, yk = coords[k]
 
-            area = 0.5 * np.linalg.det([[1, xi, yi], [1, xj, yj], [1, xk, yk]])
+            # Element area (2x for correct formula)
+            area = 0.5 * abs((xj - xi) * (yk - yi) - (xk - xi) * (yj - yi))
             if area <= 0:
                 continue
 
-            # Element geometry matrices
+            # Shape function derivatives
             beta = np.array([yj - yk, yk - yi, yi - yj])
             gamma = np.array([xk - xj, xi - xk, xj - xi])
             grad = np.array([beta, gamma]) / (2 * area)
 
+            # Get material properties for this element
+            k1 = k1_vals[idx] if hasattr(k1_vals, '__len__') else k1_vals
+            k2 = k2_vals[idx] if hasattr(k2_vals, '__len__') else k2_vals
+            theta = angles[idx] if hasattr(angles, '__len__') else angles
+
             # Anisotropic conductivity matrix
-            k1 = k1_vals[idx]
-            k2 = k2_vals[idx]
-            theta = angles[idx]
             theta_rad = np.radians(theta)
             c, s = np.cos(theta_rad), np.sin(theta_rad)
             R = np.array([[c, s], [-s, c]])
             Kmat = R.T @ np.diag([k1, k2]) @ R
 
-            # *** KEY FIX 1: Calculate kr at element centroid ***
-            xc = (xi + xj + xk) / 3.0
-            yc = (yi + yj + yk) / 3.0
-            hc = (h[i] + h[j] + h[k]) / 3.0
-            pc = hc - yc  # Pressure head at centroid
+            # Compute element pressure (centroid)
+            p_elem = (p_nodes[i] + p_nodes[j] + p_nodes[k]) / 3.0
 
-            # *** KEY FIX 2: Use material-specific kr parameters ***
-            mat_id = element_materials[idx] - 1  # Convert to 0-based indexing
-            kr0_elem = kr0_by_mat[mat_id]
-            h0_elem = h0_by_mat[mat_id]
+            # Get kr for this element based on its material properties
+            kr_elem = kr_frontal(p_elem, kr0[idx], h0[idx])
 
-            # Calculate relative permeability (Fortran front model)
-            # CRITICAL: Use element centroid pressure head
-            if pc >= 0.0:
-                kr_elem = 1.0
-            elif pc > h0_elem:
-                # Linear interpolation between kr0 and 1.0
-                kr_elem = kr0_elem + (1.0 - kr0_elem) * pc / h0_elem
-            else:
-                kr_elem = kr0_elem
-
-            # Debug output for problematic elements
-            if iteration < 3 and idx < 10:
-                print(
-                    f"  Element {idx}: mat={mat_id + 1}, pc={pc:.3f}, kr={kr_elem:.4f} (kr0={kr0_elem:.3f}, h0={h0_elem:.3f})")
-
-            # Element stiffness matrix
+            # Element stiffness matrix with kr
             ke = kr_elem * area * grad.T @ Kmat @ grad
 
-            # Assemble into global matrix
-            for a in range(3):
-                for b_ in range(3):
-                    A[tri[a], tri[b_]] += ke[a, b_]
+            # Assembly
+            for row in range(3):
+                for col in range(3):
+                    A[tri[row], tri[col]] += ke[row, col]
+
+        # Store unmodified matrix for flow computation
+        A_full = A.tocsr()
 
         # Apply boundary conditions
-        bcs = get_current_bcs()
-        for node, value in bcs:
-            A[node, :] = 0
-            A[node, node] = 1
-            b[node] = value
+        # Type 1: Fixed head (always applied)
+        # Type 2: Exit face (only if active/saturated)
+        for node_idx in range(n_nodes):
+            if nbc[node_idx] == 1:
+                A[node_idx, :] = 0
+                A[node_idx, node_idx] = 1
+                b[node_idx] = fx[node_idx]
+            elif nbc[node_idx] == 2 and exit_face_active[node_idx]:
+                A[node_idx, :] = 0
+                A[node_idx, node_idx] = 1
+                b[node_idx] = y[node_idx]
 
-        # Solve system
-        h_new = spsolve(A.tocsr(), b)
+        # Convert to CSR and solve
+        A_csr = A.tocsr()
+        h_new = spsolve(A_csr, b)
 
-        # *** KEY FIX 3: Add adaptive relaxation factor ***
-        if iteration >= 140:
-            relax = 0.005  # Even more aggressive for final convergence
-        elif iteration >= 120:
-            relax = 0.01
-        elif iteration >= 100:
-            relax = 0.02
-        elif iteration >= 80:
-            relax = 0.05
-        elif iteration >= 60:
-            relax = 0.1
-        elif iteration >= 40:
-            relax = 0.2
-        elif iteration >= 20:
-            relax = 0.5
-        else:
+        # Adaptive relaxation factor (following Fortran logic)
+        if iteration <= 20:
             relax = 1.0
+        elif iteration <= 40:
+            relax = 0.5
+        elif iteration <= 60:
+            relax = 0.2
+        elif iteration <= 80:
+            relax = 0.1
+        elif iteration <= 100:
+            relax = 0.05
+        elif iteration <= 120:
+            relax = 0.02
+        else:
+            relax = 0.01
 
         # Apply relaxation
-        h_relaxed = relax * h_new + (1.0 - relax) * h
+        if iteration > 1:
+            h_new = relax * h_new + (1 - relax) * h_last
+
+        # Compute flows at all nodes
+        q = A_full @ h_new
+
+        # Update exit face boundary conditions
+        # Exit face nodes become inactive if:
+        # 1. Head drops below elevation (unsaturated)
+        # 2. Flow is positive (outflow)
+        n_active_before = np.sum(exit_face_active)
+
+        for node_idx in range(n_nodes):
+            if nbc[node_idx] == 2:
+                if exit_face_active[node_idx]:
+                    # Check if node should become inactive
+                    if h_new[node_idx] < y[node_idx] or q[node_idx] > 0:
+                        exit_face_active[node_idx] = False
+                else:
+                    # Check if node should become active again
+                    if h_new[node_idx] >= y[node_idx] and q[node_idx] <= 0:
+                        exit_face_active[node_idx] = True
+                        h_new[node_idx] = y[node_idx]  # Reset to elevation
+
+        n_active_after = np.sum(exit_face_active)
+
+        # Compute convergence metric
+        residual = np.max(np.abs(h_new - h))
+
+        # Print detailed iteration info (first 10 iterations and when nodes change)
+        if iteration <= 3 or iteration % 20 == 0 or n_active_before != n_active_after:
+            # Print element kr values for first few iterations
+            for idx in range(min(10, len(elements))):
+                p_elem = (p_nodes[elements[idx][0]] + p_nodes[elements[idx][1]] + p_nodes[elements[idx][2]]) / 3.0
+                kr_elem = kr_frontal(p_elem, kr0[idx], h0[idx])
+                mat_id = idx // 3 + 1  # Approximate material ID
+                print(
+                    f"  Element {idx}: mat={mat_id}, pc={p_elem:.3f}, kr={kr_elem:.4f} (kr0={kr0[idx]:.3f}, h0={h0[idx]:.3f})")
+
+        print(f"Iteration {iteration}: residual = {residual:.6e}, relax = {relax:.3f}")
+        print(f"  BCs: {np.sum(nbc == 1)} fixed head, {n_active_after}/{np.sum(nbc == 2)} exit face active")
 
         # Check convergence
-        residual = np.max(np.abs(h_relaxed - h))
-
-        # Count active boundary conditions for debugging
-        n_fixed = sum(1 for i, _ in bcs if nbc[i] == 1)
-        n_exit = sum(1 for i, _ in bcs if nbc[i] == 2)
-        n_exit_total = sum(1 for i in range(n_nodes) if nbc[i] == 2)
-
-        print(f"Iteration {iteration + 1}: residual = {residual:.6e}, relax = {relax:.3f}")
-        print(f"  BCs: {n_fixed} fixed head, {n_exit}/{n_exit_total} exit face active")
-
         if residual < tol:
-            print(f"Converged in {iteration + 1} iterations!")
-            h = h_relaxed
+            print(f"Converged in {iteration} iterations")
             break
 
-        h = h_relaxed
+        # Update for next iteration
+        h = h_new.copy()
+        h_last = h_new.copy()
 
     else:
         print(f"Warning: Did not converge in {max_iter} iterations")
 
-    # Final solve for nodal flows
-    A_full = A.copy()
-    bcs = get_current_bcs()
-    for node, value in bcs:
-        A[node, :] = 0
-        A[node, node] = 1
-        b[node] = value
+    # Final flow computation with converged heads
+    q_final = A_full @ h
 
-    h_final = spsolve(A.tocsr(), b)
-    q = A_full.tocsr() @ h_final
+    # Flow potential closure check
+    total_inflow = np.sum(q_final[nbc == 1])
+    total_outflow = -np.sum(q_final[(nbc == 2) & (q_final < 0)])
+    closure_error = abs(total_inflow - total_outflow)
 
-    return h_final, A, q
+    print(f"Flow potential closure check: error = {closure_error:.6e}")
+    if closure_error > 0.01 * max(abs(total_inflow), abs(total_outflow)):
+        print(f"Warning: Large flow potential closure error = {closure_error:.6e}")
+        print("This may indicate:")
+        print("  - Non-conservative flow field")
+        print("  - Incorrect boundary identification")
+        print("  - Numerical issues in the flow solution")
 
+    return h, A_csr, q_final
 
 def kr_frontal(p, kr0, h0):
     """
@@ -574,6 +615,53 @@ def kr_frontal(p, kr0, h0):
         return kr0 + (1.0 - kr0) * p / h0
     else:
         return kr0
+
+
+def diagnose_exit_face(coords, nbc, h, q, fx):
+    """
+    Diagnostic function to understand exit face behavior
+    """
+    import numpy as np
+
+    print("\n=== Exit Face Diagnostics ===")
+    exit_nodes = np.where(nbc == 2)[0]
+    y = coords[:, 1]
+
+    print(f"Total exit face nodes: {len(exit_nodes)}")
+    print("\nNode | x      | y      | h      | h-y    | q        | Status")
+    print("-" * 65)
+
+    for node in exit_nodes:
+        x_coord = coords[node, 0]
+        y_coord = y[node]
+        head = h[node]
+        pressure = head - y_coord
+        flow = q[node]
+
+        if head >= y_coord:
+            status = "SATURATED"
+        else:
+            status = "UNSATURATED"
+
+        print(f"{node:4d} | {x_coord:6.2f} | {y_coord:6.2f} | {head:6.3f} | {pressure:6.3f} | {flow:8.3e} | {status}")
+
+    # Summary statistics
+    saturated = np.sum(h[exit_nodes] >= y[exit_nodes])
+    print(f"\nSaturated nodes: {saturated}/{len(exit_nodes)}")
+
+    # Check phreatic surface
+    print("\n=== Phreatic Surface Location ===")
+    # Find where the phreatic surface intersects the exit face
+    for i in range(len(exit_nodes) - 1):
+        n1, n2 = exit_nodes[i], exit_nodes[i + 1]
+        if (h[n1] >= y[n1]) and (h[n2] < y[n2]):
+            # Interpolate intersection point
+            y1, y2 = y[n1], y[n2]
+            h1, h2 = h[n1], h[n2]
+            y_intersect = y1 + (y2 - y1) * (h1 - y1) / (h1 - y1 - h2 + y2)
+            print(f"Phreatic surface exits between nodes {n1} and {n2}")
+            print(f"Approximate exit elevation: {y_intersect:.3f}")
+            break
 
 def create_flow_potential_bc(coords, elements, q, debug=False):
     """
