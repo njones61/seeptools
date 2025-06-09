@@ -10,6 +10,7 @@ Python Port: [Your Name or Group]
 """
 
 import numpy as np
+import matplotlib.pyplot as plt
 
 
 # Constants (from seep.inc)
@@ -128,7 +129,7 @@ class Seep2D:
                 k1_vals=k1,
                 k2_vals=k2,
                 angles=angle,
-                max_iter=150,
+                max_iter=200,
                 tol=1e-4
             )
         else:
@@ -137,7 +138,22 @@ class Seep2D:
         gamma_w = self.unit_weight
         pressure = gamma_w * (head - self.coords[:, 1])
         velocity = compute_velocity(self.coords, self.elements, head, k1, k2, angle)
-        flowrate = q[(self.nbc == 1) & (q > 0)].sum()
+
+        # Print indices and values of nodes included in the total flow sum
+        included_nodes = []
+        total_flow = 0.0
+        
+        print("\n=== Flow Balance Analysis ===")
+        print("\nNodes with positive flow (q > 0):")
+        for node_idx in range(len(self.nbc)):
+            if q[node_idx] > 0:  # Positive flow
+                included_nodes.append(node_idx)
+                total_flow += q[node_idx]
+                bc_type = "Fixed Head" if self.nbc[node_idx] == 1 else "Exit Face"
+                print(f"  Node {node_idx+1} ({bc_type}): q = {q[node_idx]:.6f}")
+
+        print("\nFlow Summary:")
+        print(f"Total flow: {total_flow:.6f}")
 
         # Solve for potential function φ for flow lines
         dirichlet_phi_bcs = create_flow_potential_bc(self.coords, self.elements, q)
@@ -151,12 +167,16 @@ class Seep2D:
             "velocity": velocity,
             "q": q,
             "phi": phi,
-            "flowrate": flowrate
+            "flowrate": total_flow
         }
 
         if hasattr(self, "export_path"):
-            export_solution_csv(self.export_path, self.coords, head, pressure, velocity, q, phi, flowrate)
+            export_solution_csv(self.export_path, self.coords, head, pressure, velocity, q, phi, total_flow)
 
+        print("Sum of all nodal flows:", np.sum(q))
+        print("Max abs interior node flow:", np.max(np.abs(q[(self.nbc != 1) & (self.nbc != 2)])))
+        print("Sum of positive flows (all nodes):", np.sum(q[q > 0]))
+        print("Sum of positive flows (boundary nodes):", np.sum(q[(q > 0) & ((self.nbc == 1) | (self.nbc == 2))]))
 
     def save_results(self, filename):
         print(f"Saving results to {filename}")
@@ -397,17 +417,85 @@ def solve_confined(coords, elements, dirichlet_bcs, k1_vals, k2_vals, angles=Non
     return head, A, q
 
 
+def compute_nodal_flows(coords, elements, head, k1_vals, k2_vals, angles, kr0, h0):
+    """
+    Compute nodal flows by assembling element-wise contributions, matching FORTRAN logic.
+    This version more closely follows the FORTRAN implementation in seep2d.f.
+    """
+    import numpy as np
+    n_nodes = coords.shape[0]
+    q = np.zeros(n_nodes)
+    y = coords[:, 1]
+    p_nodes = head - y
+
+    # Get maximum conductivity for scaling (matching FORTRAN's sck)
+    max_k = max(np.max(k1_vals), np.max(k2_vals))
+
+    # Scale conductivities down (matching FORTRAN's sc = 1.0/sck)
+    k1_scaled = k1_vals / max_k
+    k2_scaled = k2_vals / max_k
+
+    # First pass: compute element stiffness matrices and store them
+    element_stiffness = []
+    for idx, tri in enumerate(elements):
+        i, j, k = tri
+        xi, yi = coords[i]
+        xj, yj = coords[j]
+        xk, yk = coords[k]
+
+        area = 0.5 * abs((xj - xi) * (yk - yi) - (xk - xi) * (yj - yi))
+        if area <= 0:
+            element_stiffness.append(None)
+            continue
+
+        beta = np.array([yj - yk, yk - yi, yi - yj])
+        gamma = np.array([xk - xj, xi - xk, xj - xi])
+        grad = np.array([beta, gamma]) / (2 * area)
+
+        # Get material properties for this element
+        k1 = k1_scaled[idx] if hasattr(k1_scaled, '__len__') else k1_scaled
+        k2 = k2_scaled[idx] if hasattr(k2_scaled, '__len__') else k2_scaled
+        theta = angles[idx] if hasattr(angles, '__len__') else angles
+
+        theta_rad = np.radians(theta)
+        c, s = np.cos(theta_rad), np.sin(theta_rad)
+        R = np.array([[c, s], [-s, c]])
+        Kmat = R.T @ np.diag([k1, k2]) @ R
+
+        # Compute element pressure (centroid)
+        p_elem = (p_nodes[i] + p_nodes[j] + p_nodes[k]) / 3.0
+        kr_elem = kr_frontal(p_elem, kr0[idx], h0[idx])
+
+        # Element stiffness matrix with kr
+        ke = kr_elem * area * grad.T @ Kmat @ grad
+        element_stiffness.append(ke)
+
+    # Second pass: compute flows using stored stiffness matrices
+    for idx, tri in enumerate(elements):
+        ke = element_stiffness[idx]
+        if ke is None:
+            continue
+
+        i, j, k = tri
+        h_elem = head[[i, j, k]]
+        
+        # Local flow vector for this element: f = ke @ h_elem
+        f_elem = ke @ h_elem
+
+        # Distribute to nodes (FORTRAN logic: add to each node)
+        for local, global_node in enumerate([i, j, k]):
+            q[global_node] += f_elem[local]
+
+    # Scale flows back up (matching FORTRAN's flowsc = flow * sck)
+    q = q * max_k
+
+    return q
+
 def solve_unsaturated(coords, elements, nbc, fx, kr0=0.001, h0=-1.0,
                       k1_vals=1.0, k2_vals=1.0, angles=0.0,
-                      max_iter=150, tol=1e-4):
+                      max_iter=200, tol=1e-4):
     """
     Iterative FEM solver for unconfined flow using linear kr frontal function.
-
-    This version includes:
-    - Adaptive relaxation factors
-    - Proper exit face boundary condition updates
-    - Element-wise kr computation
-    - Convergence monitoring with active node tracking
     """
     import numpy as np
     from scipy.sparse import lil_matrix, csr_matrix
@@ -417,8 +505,6 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.001, h0=-1.0,
     y = coords[:, 1]
 
     # Initialize heads
-    # For exit face nodes (nbc==2), start with h = elevation
-    # For fixed head nodes (nbc==1), use prescribed values
     h = np.zeros(n_nodes)
     for node_idx in range(n_nodes):
         if nbc[node_idx] == 1:
@@ -426,7 +512,6 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.001, h0=-1.0,
         elif nbc[node_idx] == 2:
             h[node_idx] = y[node_idx]
         else:
-            # Initialize other nodes to average of fixed heads
             fixed_heads = fx[nbc == 1]
             h[node_idx] = np.mean(fixed_heads) if len(fixed_heads) > 0 else np.mean(y)
 
@@ -443,9 +528,22 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.001, h0=-1.0,
     if np.isscalar(h0):
         h0 = np.full(len(elements), h0)
 
+    # Set convergence tolerance based on domain height
+    ymin, ymax = np.min(y), np.max(y)
+    eps = (ymax - ymin) * 0.0001
+
     print("Starting unsaturated flow iteration...")
+    print(f"Convergence tolerance: {eps:.6e}")
+
+    # Track convergence history
+    residuals = []
+    relax = 1.0  # Initial relaxation factor
+    prev_residual = float('inf')
 
     for iteration in range(1, max_iter + 1):
+        # Reset diagnostics for this iteration
+        kr_diagnostics = []
+
         # Build global stiffness matrix
         A = lil_matrix((n_nodes, n_nodes))
         b = np.zeros(n_nodes)
@@ -460,7 +558,7 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.001, h0=-1.0,
             xj, yj = coords[j]
             xk, yk = coords[k]
 
-            # Element area (2x for correct formula)
+            # Element area
             area = 0.5 * abs((xj - xi) * (yk - yi) - (xk - xi) * (yj - yi))
             if area <= 0:
                 continue
@@ -490,6 +588,15 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.001, h0=-1.0,
             # Element stiffness matrix with kr
             ke = kr_elem * area * grad.T @ Kmat @ grad
 
+            # Inside the element assembly loop, after kr_elem is computed:
+            kr_diagnostics.append({
+                'element': idx,
+                'p_elem': p_elem,
+                'kr_elem': kr_elem,
+                'y_centroid': (yi + yj + yk) / 3.0,
+                'h_centroid': (h[i] + h[j] + h[k]) / 3.0
+            })
+
             # Assembly
             for row in range(3):
                 for col in range(3):
@@ -499,8 +606,6 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.001, h0=-1.0,
         A_full = A.tocsr()
 
         # Apply boundary conditions
-        # Type 1: Fixed head (always applied)
-        # Type 2: Exit face (only if active/saturated)
         for node_idx in range(n_nodes):
             if nbc[node_idx] == 1:
                 A[node_idx, :] = 0
@@ -515,67 +620,55 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.001, h0=-1.0,
         A_csr = A.tocsr()
         h_new = spsolve(A_csr, b)
 
-        # Adaptive relaxation factor (following Fortran logic)
-        if iteration <= 20:
-            relax = 1.0
-        elif iteration <= 40:
+        # FORTRAN-style relaxation strategy
+        if iteration > 20:
             relax = 0.5
-        elif iteration <= 60:
+        if iteration > 40:
             relax = 0.2
-        elif iteration <= 80:
+        if iteration > 60:
             relax = 0.1
-        elif iteration <= 100:
+        if iteration > 80:
             relax = 0.05
-        elif iteration <= 120:
+        if iteration > 100:
             relax = 0.02
-        else:
+        if iteration > 120:
             relax = 0.01
 
         # Apply relaxation
-        if iteration > 1:
-            h_new = relax * h_new + (1 - relax) * h_last
+        h_new = relax * h_new + (1 - relax) * h_last
 
-        # Compute flows at all nodes
+        # Compute flows at all nodes (not used for closure, but for exit face logic)
         q = A_full @ h_new
 
-        # Update exit face boundary conditions
-        # Exit face nodes become inactive if:
-        # 1. Head drops below elevation (unsaturated)
-        # 2. Flow is positive (outflow)
+        # Update exit face boundary conditions with hysteresis
         n_active_before = np.sum(exit_face_active)
+        hyst = 0.001 * (ymax - ymin)  # Hysteresis threshold
 
         for node_idx in range(n_nodes):
             if nbc[node_idx] == 2:
                 if exit_face_active[node_idx]:
                     # Check if node should become inactive
-                    if h_new[node_idx] < y[node_idx] or q[node_idx] > 0:
+                    if h_new[node_idx] < y[node_idx] - hyst or q[node_idx] > 0:
                         exit_face_active[node_idx] = False
                 else:
                     # Check if node should become active again
-                    if h_new[node_idx] >= y[node_idx] and q[node_idx] <= 0:
+                    if h_new[node_idx] >= y[node_idx] + hyst and q[node_idx] <= 0:
                         exit_face_active[node_idx] = True
                         h_new[node_idx] = y[node_idx]  # Reset to elevation
 
         n_active_after = np.sum(exit_face_active)
 
-        # Compute convergence metric
-        residual = np.max(np.abs(h_new - h))
+        # Compute relative residual
+        residual = np.max(np.abs(h_new - h)) / (np.max(np.abs(h)) + 1e-10)
+        residuals.append(residual)
 
-        # Print detailed iteration info (first 10 iterations and when nodes change)
+        # Print detailed iteration info
         if iteration <= 3 or iteration % 20 == 0 or n_active_before != n_active_after:
-            # Print element kr values for first few iterations
-            for idx in range(min(10, len(elements))):
-                p_elem = (p_nodes[elements[idx][0]] + p_nodes[elements[idx][1]] + p_nodes[elements[idx][2]]) / 3.0
-                kr_elem = kr_frontal(p_elem, kr0[idx], h0[idx])
-                mat_id = idx // 3 + 1  # Approximate material ID
-                print(
-                    f"  Element {idx}: mat={mat_id}, pc={p_elem:.3f}, kr={kr_elem:.4f} (kr0={kr0[idx]:.3f}, h0={h0[idx]:.3f})")
-
-        print(f"Iteration {iteration}: residual = {residual:.6e}, relax = {relax:.3f}")
-        print(f"  BCs: {np.sum(nbc == 1)} fixed head, {n_active_after}/{np.sum(nbc == 2)} exit face active")
+            print(f"Iteration {iteration}: residual = {residual:.6e}, relax = {relax:.3f}")
+            print(f"  BCs: {np.sum(nbc == 1)} fixed head, {n_active_after}/{np.sum(nbc == 2)} exit face active")
 
         # Check convergence
-        if residual < tol:
+        if residual < eps:
             print(f"Converged in {iteration} iterations")
             break
 
@@ -585,22 +678,45 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.001, h0=-1.0,
 
     else:
         print(f"Warning: Did not converge in {max_iter} iterations")
+        print("\nConvergence history:")
+        for i, r in enumerate(residuals):
+            if i % 20 == 0 or i == len(residuals) - 1:
+                print(f"  Iteration {i+1}: residual = {r:.6e}")
 
-    # Final flow computation with converged heads
-    q_final = A_full @ h
+    # Final flow computation with converged heads (FORTRAN-style)
+    q_final = compute_nodal_flows(
+        coords, elements, h, k1_vals, k2_vals, angles, kr0, h0
+    )
 
-    # Flow potential closure check
-    total_inflow = np.sum(q_final[nbc == 1])
-    total_outflow = -np.sum(q_final[(nbc == 2) & (q_final < 0)])
+    # Flow potential closure check - FORTRAN-style
+    total_inflow = 0.0
+    total_outflow = 0.0
+    
+    for node_idx in range(n_nodes):
+        if nbc[node_idx] == 1:  # Fixed head boundary
+            if q_final[node_idx] > 0:
+                total_inflow += q_final[node_idx]
+        elif nbc[node_idx] == 2 and exit_face_active[node_idx]:  # Active exit face
+            if q_final[node_idx] < 0:
+                total_outflow -= q_final[node_idx]
+
     closure_error = abs(total_inflow - total_outflow)
-
     print(f"Flow potential closure check: error = {closure_error:.6e}")
+    print(f"Total inflow: {total_inflow:.6e}")
+    print(f"Total outflow: {total_outflow:.6e}")
+
     if closure_error > 0.01 * max(abs(total_inflow), abs(total_outflow)):
         print(f"Warning: Large flow potential closure error = {closure_error:.6e}")
         print("This may indicate:")
         print("  - Non-conservative flow field")
         print("  - Incorrect boundary identification")
         print("  - Numerical issues in the flow solution")
+
+    # After convergence or last iteration, print diagnostics
+    if iteration == max_iter or residual < eps:
+        kr_vals = [d['kr_elem'] for d in kr_diagnostics]
+        centroids = np.mean(coords[elements], axis=1)
+        plot_kr_field(coords, elements, kr_vals, title=f'Kr Field (iteration {iteration})')
 
     return h, A_csr, q_final
 
@@ -932,3 +1048,225 @@ def compute_velocity(coords, elements, head, k1_vals, k2_vals, angles):
     count[count == 0] = 1  # Avoid division by zero
     velocity /= count[:, None]
     return velocity
+
+def compare_python_fortran_nodal_results(python_head, python_q, fortran_out_path, node_offset=1, verbose=True, nbc=None):
+    """
+    Compare Python and FORTRAN nodal heads and flows and save results to Excel.
+    - python_head: numpy array of nodal heads (Python, index 0 = node 1 in FORTRAN)
+    - python_q: numpy array of nodal flows (same indexing)
+    - fortran_out_path: path to FORTRAN .out file
+    - node_offset: 1 if FORTRAN nodes are 1-based, 0 if 0-based
+    - verbose: if True, print summary statistics
+    - nbc: array of boundary condition types (0=interior, 1=fixed head, 2=exit face)
+    """
+    import re
+    import numpy as np
+    import pandas as pd
+    from pathlib import Path
+
+    # Debug prints for nbc array
+    print("\n=== Debug: Boundary Conditions ===")
+    print(f"nbc is None: {nbc is None}")
+    if nbc is not None:
+        print(f"nbc type: {type(nbc)}")
+        print(f"nbc shape: {nbc.shape if hasattr(nbc, 'shape') else len(nbc)}")
+        print(f"nbc dtype: {nbc.dtype if hasattr(nbc, 'dtype') else type(nbc[0])}")
+        print(f"nbc unique values: {np.unique(nbc)}")
+        print(f"nbc first 10 values: {nbc[:10]}")
+        print(f"Number of interior nodes (0): {np.sum(nbc == 0)}")
+        print(f"Number of fixed head nodes (1): {np.sum(nbc == 1)}")
+        print(f"Number of exit face nodes (2): {np.sum(nbc == 2)}")
+
+    # Read the FORTRAN output file and find the relevant section
+    with open(fortran_out_path, 'r') as f:
+        lines = f.readlines()
+
+    # Find the start of the 'Nodal Flows and Heads' section
+    start_idx = None
+    for i, line in enumerate(lines):
+        if 'Nodal Flows and Heads' in line:
+            start_idx = i
+            break
+    if start_idx is None:
+        raise ValueError('Could not find "Nodal Flows and Heads" section in FORTRAN output.')
+
+    # Skip header lines to the data
+    data_start = start_idx + 5  # 5 lines after header is usually where data starts
+    nodal_data = []
+    for line in lines[data_start:]:
+        if not line.strip():
+            continue
+        # Stop if we hit a non-data line (e.g., next section)
+        if re.match(r'\s*\d+\s+\d', line) is None and re.match(r'\s*\d+\s+\d', line.strip()) is None:
+            # If line doesn't start with a node number, break
+            if not re.match(r'\s*\d+', line):
+                break
+        # Parse node, head, percent, (optional) flow
+        m = re.match(r'\s*(\d+)\s+([\d.Ee+-]+)\s+([\d.Ee+-]+)\s*%?\s*([\d.Ee+-]*)', line)
+        if m:
+            node = int(m.group(1))
+            head = float(m.group(2))
+            # percent = float(m.group(3))  # Not used
+            flow_str = m.group(4)
+            flow = float(flow_str) if flow_str.strip() else np.nan
+            nodal_data.append((node, head, flow))
+        else:
+            # If the line doesn't match, stop parsing
+            break
+
+    # Convert to arrays
+    fortran_nodes = np.array([n[0] for n in nodal_data], dtype=int)
+    fortran_head = np.array([n[1] for n in nodal_data], dtype=float)
+    fortran_flow = np.array([n[2] for n in nodal_data], dtype=float)
+
+    # Align indices: assume node 1 in FORTRAN is index 0 in Python
+    n_compare = min(len(fortran_head), len(python_head))
+    head_diff = python_head[:n_compare] - fortran_head[:n_compare]
+    q_diff = python_q[:n_compare] - fortran_flow[:n_compare]
+
+    # Create BC type mapping
+    bc_type_map = {0: 'Interior', 1: 'Fixed Head', 2: 'Exit Face'}
+    bc_types = np.array(['Unknown'] * n_compare)
+    if nbc is not None:
+        print(f"\nDebug: Creating BC types array")
+        print(f"n_compare: {n_compare}")
+        print(f"nbc length: {len(nbc)}")
+        # Convert nbc to numpy array if it isn't already
+        nbc = np.asarray(nbc)
+        # Create BC types array
+        bc_types = np.array([bc_type_map.get(int(nbc[i]), 'Unknown') for i in range(n_compare)])
+        print(f"First 10 BC types: {bc_types[:10]}")
+        print(f"Unique BC types: {np.unique(bc_types)}")
+
+    # Create DataFrame for comparison
+    df = pd.DataFrame({
+        'Node': np.arange(node_offset, n_compare + node_offset),
+        'BC_Type': bc_types,
+        'Python_Head': python_head[:n_compare],
+        'FORTRAN_Head': fortran_head[:n_compare],
+        'Head_Diff': head_diff,
+        'Python_Q': python_q[:n_compare],
+        'FORTRAN_Q': fortran_flow[:n_compare],
+        'Q_Diff': q_diff
+    })
+
+    # Add summary statistics
+    summary_stats = {
+        'Metric': [
+            'Max abs(head diff)',
+            'Mean abs(head diff)',
+            'Std abs(head diff)',
+            'Max abs(q diff)',
+            'Mean abs(q diff)',
+            'Std abs(q diff)'
+        ],
+        'Value': [
+            np.max(np.abs(head_diff)),
+            np.mean(np.abs(head_diff)),
+            np.std(head_diff),
+            np.max(np.abs(q_diff[~np.isnan(fortran_flow[:n_compare])])),
+            np.mean(np.abs(q_diff[~np.isnan(fortran_flow[:n_compare])])),
+            np.std(q_diff[~np.isnan(fortran_flow[:n_compare])])
+        ]
+    }
+    summary_df = pd.DataFrame(summary_stats)
+
+    # Add BC-specific statistics if nbc is provided
+    if nbc is not None:
+        bc_stats = []
+        for bc_type in [0, 1, 2]:
+            mask = nbc[:n_compare] == bc_type
+            if np.any(mask):
+                bc_name = bc_type_map[bc_type]
+                # Head statistics
+                head_mask = mask
+                if np.any(head_mask):
+                    bc_stats.extend([
+                        [f'{bc_name} - Max abs(head diff)', np.max(np.abs(head_diff[head_mask]))],
+                        [f'{bc_name} - Mean abs(head diff)', np.mean(np.abs(head_diff[head_mask]))]
+                    ])
+                
+                # Flow statistics (only for nodes with valid FORTRAN flow data)
+                flow_mask = mask & ~np.isnan(fortran_flow[:n_compare])
+                if np.any(flow_mask):
+                    bc_stats.extend([
+                        [f'{bc_name} - Max abs(q diff)', np.max(np.abs(q_diff[flow_mask]))],
+                        [f'{bc_name} - Mean abs(q diff)', np.mean(np.abs(q_diff[flow_mask]))]
+                    ])
+        
+        if bc_stats:
+            bc_summary_df = pd.DataFrame(bc_stats, columns=['Metric', 'Value'])
+            summary_df = pd.concat([summary_df, bc_summary_df], ignore_index=True)
+
+    # Create Excel writer
+    output_path = Path(fortran_out_path).with_suffix('.xlsx')
+    with pd.ExcelWriter(output_path) as writer:
+        # Write main comparison data
+        df.to_excel(writer, sheet_name='Nodal Comparison', index=False)
+        
+        # Write summary statistics
+        summary_df.to_excel(writer, sheet_name='Summary Statistics', index=False)
+        
+        # Auto-adjust column widths
+        for sheet_name in writer.sheets:
+            worksheet = writer.sheets[sheet_name]
+            for idx, col in enumerate(df.columns):
+                max_length = max(
+                    df[col].astype(str).apply(len).max(),
+                    len(col)
+                )
+                worksheet.column_dimensions[chr(65 + idx)].width = max_length + 2
+
+    if verbose:
+        print(f"\nComparison results saved to: {output_path}")
+        print("\n=== Python vs FORTRAN Nodal Head Comparison ===")
+        print(f"Max abs(head diff): {np.max(np.abs(head_diff)):.4e}")
+        print(f"Mean abs(head diff): {np.mean(np.abs(head_diff)):.4e}")
+        print(f"Std abs(head diff): {np.std(head_diff):.4e}")
+
+        print("\n=== Python vs FORTRAN Nodal Flow Comparison ===")
+        # Only compare where FORTRAN flow is not nan
+        valid = ~np.isnan(fortran_flow[:n_compare])
+        if np.any(valid):
+            print(f"Max abs(q diff): {np.max(np.abs(q_diff[valid])):.4e}")
+            print(f"Mean abs(q diff): {np.mean(np.abs(q_diff[valid])):.4e}")
+            print(f"Std abs(q diff): {np.std(q_diff[valid]):.4e}")
+        else:
+            print("No FORTRAN flow data to compare.")
+
+        if nbc is not None:
+            print("\n=== Boundary Condition Statistics ===")
+            for bc_type in [0, 1, 2]:
+                mask = nbc[:n_compare] == bc_type
+                if np.any(mask):
+                    bc_name = bc_type_map[bc_type]
+                    print(f"\n{bc_name} nodes:")
+                    print(f"  Count: {np.sum(mask)}")
+                    # Head statistics
+                    print(f"  Max abs(head diff): {np.max(np.abs(head_diff[mask])):.4e}")
+                    print(f"  Mean abs(head diff): {np.mean(np.abs(head_diff[mask])):.4e}")
+                    # Flow statistics (only for nodes with valid FORTRAN flow data)
+                    valid_q = mask & ~np.isnan(fortran_flow[:n_compare])
+                    if np.any(valid_q):
+                        print(f"  Max abs(q diff): {np.max(np.abs(q_diff[valid_q])):.4e}")
+                        print(f"  Mean abs(q diff): {np.mean(np.abs(q_diff[valid_q])):.4e}")
+                    else:
+                        print("  No valid flow data for comparison")
+
+    return head_diff, q_diff
+
+def plot_kr_field(coords, elements, kr_vals, title='Kr Field'):
+    """
+    Plot the kr field at element centroids.
+    """
+    import numpy as np
+    centroids = np.mean(coords[elements], axis=1)
+    plt.figure(figsize=(10, 4))
+    sc = plt.scatter(centroids[:, 0], centroids[:, 1], c=kr_vals, cmap='viridis', s=30, edgecolor='k')
+    plt.colorbar(sc, label='k_r')
+    plt.xlabel('x')
+    plt.ylabel('y')
+    plt.title(title)
+    plt.gca().set_aspect('equal')
+    plt.tight_layout()
+    plt.show()
