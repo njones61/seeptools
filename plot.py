@@ -97,7 +97,7 @@ def plot_solution_OLD(coords, elements, head, flowrate=None, levels=20):
     plt.show()
 
 
-def plot_solution(coords, elements, head, phi=None, flowrate=None, levels=20, base_mat=None, k1_by_mat=None):
+def plot_solution_OLD(coords, elements, head, phi=None, flowrate=None, levels=20, base_mat=None, k1_by_mat=None):
     """
     Plots head contours and optionally overlays flowlines (phi) based on flow function.
     Fixed version that properly handles mesh aspect ratio and doesn't clip the plot.
@@ -200,6 +200,134 @@ def plot_solution(coords, elements, head, phi=None, flowrate=None, levels=20, ba
     plt.tight_layout()
     plt.show()
 
+
+def plot_solution(coords, elements, head, phi=None, flowrate=None, levels=20, base_mat=None, k1_by_mat=None,
+                  fill_contours=True, phreatic=True, element_materials=None):
+    """
+    Plots head contours and optionally overlays flowlines (phi) based on flow function.
+    Fixed version that properly handles mesh aspect ratio and doesn't clip the plot.
+
+    Arguments:
+        coords: (n_nodes, 2) array of node coordinates
+        elements: (n_elements, 3) array of triangle indices
+        head: (n_nodes,) array of total head values
+        phi: (n_nodes,) array of flow potential values (optional)
+        flowrate: total flowrate (optional, required for phi contours)
+        levels: number of head contour levels
+        base_mat: material ID (1-based) used to compute k for flow function
+        k1_by_mat: (n_materials,) array of k1 values by material ID (required if base_mat is given)
+        fill_contours: bool, if True shows filled contours, if False only black solid lines
+        phreatic: bool, if True plots phreatic surface (pressure head = 0) as thick red line
+        element_materials: (n_elements,) array of material IDs for each element (optional)
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.tri as tri
+    from matplotlib.ticker import MaxNLocator
+    import numpy as np
+
+    # Calculate proper figure size based on mesh aspect ratio
+    x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
+    y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
+
+    x_range = x_max - x_min
+    y_range = y_max - y_min
+    mesh_aspect = x_range / y_range if y_range > 0 else 1.0
+
+    # Set figure size to accommodate the mesh properly
+    if mesh_aspect > 2.0:  # Wide mesh
+        fig_width = 12
+        fig_height = 12 / mesh_aspect
+    elif mesh_aspect < 0.5:  # Tall mesh
+        fig_height = 10
+        fig_width = 10 * mesh_aspect
+    else:  # Roughly square mesh
+        fig_width = 10
+        fig_height = 10 / mesh_aspect
+
+    # Ensure minimum size
+    fig_width = max(fig_width, 6)
+    fig_height = max(fig_height, 4)
+
+    print(f"Mesh bounds: x=[{x_min:.1f}, {x_max:.1f}], y=[{y_min:.1f}, {y_max:.1f}]")
+    print(f"Mesh aspect ratio: {mesh_aspect:.2f}, Figure size: {fig_width:.1f} x {fig_height:.1f}")
+
+    triang = tri.Triangulation(coords[:, 0], coords[:, 1], elements)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    # Plot material zones first (if element_materials provided)
+    if element_materials is not None:
+        materials = np.unique(element_materials)
+        cmap = plt.get_cmap("tab10", len(materials))
+        mat_to_color = {mat: cmap(i) for i, mat in enumerate(materials)}
+
+        for idx, tri_nodes in enumerate(elements):
+            polygon = coords[tri_nodes]
+            color = mat_to_color[element_materials[idx]]
+            ax.fill(*zip(*polygon), edgecolor='none', facecolor=color, alpha=0.5)
+
+    vmin = np.min(head)
+    vmax = np.max(head)
+    hdrop = vmax - vmin
+    contour_levels = np.linspace(vmin, vmax, levels)
+
+    # Filled contours (only if fill_contours=True)
+    if fill_contours:
+        contourf = ax.tricontourf(triang, head, levels=contour_levels, cmap="Spectral_r", vmin=vmin, vmax=vmax,
+                                  alpha=0.5)
+        cbar = plt.colorbar(contourf, ax=ax, label="Total Head")
+        cbar.locator = MaxNLocator(nbins=10, steps=[1, 2, 5])
+        cbar.update_ticks()
+
+    # Solid lines for head contours
+    ax.tricontour(triang, head, levels=contour_levels, colors="k", linewidths=0.5)
+
+    # Phreatic surface (pressure head = 0)
+    if phreatic:
+        elevation = coords[:, 1]  # y-coordinate is elevation
+        pressure_head = head - elevation
+        ax.tricontour(triang, pressure_head, levels=[0], colors="red", linewidths=2.0)
+
+    # Overlay flowlines if phi is available
+    if phi is not None and flowrate is not None and base_mat is not None and k1_by_mat is not None:
+        # Materials are 1-based, so adjust index
+        base_k = k1_by_mat[base_mat - 1]
+        ne = levels - 1
+        nf = (flowrate * ne) / (base_k * hdrop)
+        phi_levels = round(nf) + 1
+        print(f"Computed nf: {nf:.2f}, using {phi_levels} φ contours (base k={base_k}, head drop={hdrop:.3f})")
+        phi_contours = np.linspace(np.min(phi), np.max(phi), phi_levels)
+        ax.tricontour(triang, phi, levels=phi_contours, colors="blue", linewidths=0.7, linestyles="solid")
+
+    # Plot the mesh boundary
+    try:
+        boundary = get_ordered_boundary(coords, elements)
+        ax.plot(boundary[:, 0], boundary[:, 1], color="black", linewidth=1.0, label="Mesh Boundary")
+    except Exception as e:
+        print(f"Warning: Could not plot mesh boundary: {e}")
+
+    # Set explicit axis limits to ensure full mesh is shown
+    margin = 0.10  # 10% margin
+    x_margin = x_range * margin
+    y_margin = y_range * margin
+
+    ax.set_xlim(x_min - x_margin, x_max + x_margin)
+    ax.set_ylim(y_min - y_margin, y_max + y_margin)
+
+    title = "Flow Net: Head Contours"
+    if phi is not None:
+        title += " and Flowlines"
+    if phreatic:
+        title += " with Phreatic Surface"
+    if flowrate is not None:
+        title += f" — Total Flowrate: {flowrate:.3f}"
+    ax.set_title(title)
+
+    # Set equal aspect ratio AFTER setting limits
+    ax.set_aspect("equal")
+
+    # Adjust layout to prevent clipping
+    plt.tight_layout()
+    plt.show()
 
 def get_ordered_boundary(coords, elements):
     """

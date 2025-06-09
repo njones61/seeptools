@@ -35,7 +35,10 @@ plot_solution(model.coords,
               phi=model.solution["phi"],
               flowrate=model.solution["flowrate"],
               base_mat=1,  # assuming material ID 1 is the base material
-              k1_by_mat=model.k1_by_mat)
+              k1_by_mat=model.k1_by_mat,
+              fill_contours=False,  # Set to False for black lines only
+              phreatic=True,       # Set to False to hide phreatic surface
+              element_materials=model.element_materials)  # Add material coloring
 
 # Plot flownet
 #plot_flownet(model.coords, model.elements, model.solution["head"], model.solution["phi"], flowrate=model.solution["flowrate"])

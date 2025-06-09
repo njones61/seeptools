@@ -114,18 +114,19 @@ class Seep2D:
 
         # Solve for head, stiffness matrix A, and nodal flow vector q
         if is_unconfined:
-            kr0 = float(self.kr0_by_mat[0])
-            h0 = float(self.h0_by_mat[0])
             head, A, q = solve_unsaturated(
                 self.coords,
                 self.elements,
                 self.nbc,
                 self.fx,
-                kr0=kr0,
-                h0=h0,
-                k1_vals=k1,
-                k2_vals=k2,
-                angles=angle
+                self.kr0_by_mat,
+                self.h0_by_mat,
+                self.element_materials,
+                k1,
+                k2,
+                angle,
+                max_iter=150,
+                tol=1e-4
             )
         else:
             head, A, q = solve_confined(self.coords, self.elements, bcs, k1, k2, angle)
@@ -393,15 +394,17 @@ def solve_confined(coords, elements, dirichlet_bcs, k1_vals, k2_vals, angles=Non
     return head, A, q
 
 
-def solve_unsaturated(coords, elements, nbc, fx, kr0=0.1, h0=-1.0,
-                      k1_vals=1.0, k2_vals=1.0, angles=0.0,
-                      max_iter=50, tol=1e-4):
+def solve_unsaturated(coords, elements, nbc, fx, kr0_by_mat, h0_by_mat,
+                      element_materials, k1_vals, k2_vals, angles,
+                      max_iter=200, tol=5e-5):
     """
-    Complete FORTRAN-based unsaturated flow solver following the exact sequence:
-    1. Initialize arrays (lines 100, 360-400)
-    2. Iteration loop (420-490)
-    3. FORTRAN relaxation and convergence logic
-    4. Exit face handling with count array
+    Fixed iterative FEM solver for unconfined flow matching Fortran implementation.
+
+    Key fixes:
+    1. Added adaptive relaxation factor
+    2. Calculate kr at element centroid (not nodes)
+    3. Use material-specific kr parameters
+    4. Proper boundary condition updating
     """
     import numpy as np
     from scipy.sparse import lil_matrix
@@ -410,219 +413,167 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.1, h0=-1.0,
     n_nodes = coords.shape[0]
     y = coords[:, 1]
 
-    # FORTRAN initialization (lines 100, 200)
-    hlast = np.full(n_nodes, 1e30)  # hlast(n) = 1.d30
-    count = np.zeros(n_nodes)  # count(n) = 0.d0
-    flow = np.zeros(n_nodes)  # flow(n) = 0.d0
+    # Better initial guess - use average of fixed head values
+    fixed_heads = fx[nbc == 1]
+    if len(fixed_heads) > 0:
+        h = np.full(n_nodes, np.mean(fixed_heads))
+    else:
+        h = np.full(n_nodes, np.max(y) + 1.0)
 
-    # FORTRAN: Pre-process fx for exit face nodes (line 200)
-    fx_corrected = fx.copy()
-    for n in range(n_nodes):
-        if nbc[n] == 1:
-            fx_corrected[n] = fx[n]  # Fixed head
-        elif nbc[n] == 2:
-            fx_corrected[n] = y[n]  # Exit face: fx(n) = y(n)
+    # Initial BCs: fixed head (nbc == 1) + exit face (nbc == 2) as h = elevation
+    def get_current_bcs():
+        bcs = []
+        for i in range(n_nodes):
+            if nbc[i] == 1:  # Fixed head
+                bcs.append((i, fx[i]))
+            elif nbc[i] == 2:  # Exit face
+                if h[i] >= y[i]:  # Still saturated
+                    bcs.append((i, y[i]))
+                # else: becomes no-flow (not included in bcs)
+        return bcs
 
-    # FORTRAN count array initialization (lines 360-400)
-    # Find lowest exit face nodes and activate them
-    exit_nodes = np.where(nbc == 2)[0]
-    if len(exit_nodes) > 0:
-        exit_elevations = y[exit_nodes]
-        nsmall = []
-        ysmall = []
+    print(f"Starting unsaturated flow iteration...")
 
-        # Find 2 lowest exit face nodes (FORTRAN nsmall logic)
-        sorted_indices = np.argsort(exit_elevations)
-        for i in range(min(2, len(exit_nodes))):
-            nsmall.append(exit_nodes[sorted_indices[i]])
-            ysmall.append(exit_elevations[sorted_indices[i]])
-
-        # Activate lowest exit face nodes (lines 390-400)
-        if len(nsmall) > 0:
-            count[nsmall[0]] = 1.0
-            if len(nsmall) > 1:
-                count[nsmall[1]] = 1.0
-
-        print(f"FORTRAN: Activated exit face nodes {nsmall}")
-
-    # FORTRAN convergence tolerance (line 400)
-    ymin, ymax = y.min(), y.max()
-    eps = (ymax - ymin) * 0.0001
-    relax = 1.0
-
-    print(f"FORTRAN: eps = {eps:.6e}, ymin = {ymin:.3f}, ymax = {ymax:.3f}")
-
-    # Initialize head field
-    head_initial = np.mean(fx_corrected[nbc == 1]) if np.any(nbc == 1) else 1.0
-    r = np.full(n_nodes, head_initial)  # FORTRAN r array
-
-    # FORTRAN main iteration loop with correct convergence logic
-    iconv = 0  # FORTRAN convergence counter
-
-    for k in range(1, max_iter + 1):
-        print(f"FORTRAN iteration {k}")
-
-        # FORTRAN relaxation schedule (lines 420-440)
-        if k > 20:
-            relax = 0.5
-        if k > 40:
-            relax = 0.2
-        if k > 60:
-            relax = 0.1
-        if k > 80:
-            relax = 0.05
-        if k > 100:
-            relax = 0.02
-        if k > 120:
-            relax = 0.01
-
-        # Assemble stiffness matrix
+    for iteration in range(max_iter):
         A = lil_matrix((n_nodes, n_nodes))
         b = np.zeros(n_nodes)
 
-        # Compute relative permeability
-        p = r - y
-        kr_node = kr_frontal(p, kr0, h0)
-
-        # Element assembly
+        # Build stiffness matrix
         for idx, tri in enumerate(elements):
-            i, j, k_node = tri
+            i, j, k = tri
             xi, yi = coords[i]
             xj, yj = coords[j]
-            xk, yk = coords[k_node]
+            xk, yk = coords[k]
 
             area = 0.5 * np.linalg.det([[1, xi, yi], [1, xj, yj], [1, xk, yk]])
             if area <= 0:
                 continue
 
+            # Element geometry matrices
             beta = np.array([yj - yk, yk - yi, yi - yj])
             gamma = np.array([xk - xj, xi - xk, xj - xi])
             grad = np.array([beta, gamma]) / (2 * area)
 
-            # Material properties
-            if np.isscalar(k1_vals):
-                k1, k2, theta = k1_vals, k2_vals, angles
-            else:
-                k1, k2, theta = k1_vals[idx], k2_vals[idx], angles[idx]
-
-            # Anisotropic conductivity
+            # Anisotropic conductivity matrix
+            k1 = k1_vals[idx]
+            k2 = k2_vals[idx]
+            theta = angles[idx]
             theta_rad = np.radians(theta)
             c, s = np.cos(theta_rad), np.sin(theta_rad)
             R = np.array([[c, s], [-s, c]])
             Kmat = R.T @ np.diag([k1, k2]) @ R
 
-            # Average relative permeability
-            kr_avg = np.mean([kr_node[i], kr_node[j], kr_node[k_node]])
-            ke = kr_avg * area * grad.T @ Kmat @ grad
+            # *** KEY FIX 1: Calculate kr at element centroid ***
+            xc = (xi + xj + xk) / 3.0
+            yc = (yi + yj + yk) / 3.0
+            hc = (h[i] + h[j] + h[k]) / 3.0
+            pc = hc - yc  # Pressure head at centroid
 
+            # *** KEY FIX 2: Use material-specific kr parameters ***
+            mat_id = element_materials[idx] - 1  # Convert to 0-based indexing
+            kr0_elem = kr0_by_mat[mat_id]
+            h0_elem = h0_by_mat[mat_id]
+
+            # Calculate relative permeability (Fortran front model)
+            # CRITICAL: Use element centroid pressure head
+            if pc >= 0.0:
+                kr_elem = 1.0
+            elif pc > h0_elem:
+                # Linear interpolation between kr0 and 1.0
+                kr_elem = kr0_elem + (1.0 - kr0_elem) * pc / h0_elem
+            else:
+                kr_elem = kr0_elem
+
+            # Debug output for problematic elements
+            if iteration < 3 and idx < 10:
+                print(
+                    f"  Element {idx}: mat={mat_id + 1}, pc={pc:.3f}, kr={kr_elem:.4f} (kr0={kr0_elem:.3f}, h0={h0_elem:.3f})")
+
+            # Element stiffness matrix
+            ke = kr_elem * area * grad.T @ Kmat @ grad
+
+            # Assemble into global matrix
             for a in range(3):
                 for b_ in range(3):
                     A[tri[a], tri[b_]] += ke[a, b_]
 
-        # FORTRAN boundary condition application (modify subroutine)
-        for i in range(n_nodes):
-            if nbc[i] <= 0:  # No BC
-                continue
-            elif nbc[i] == 2:  # Exit face
-                if count[i] == 0:  # Inactive exit face
-                    continue
-                h_bc = y[i]  # Use elevation
-            else:  # Fixed head (nbc == 1)
-                h_bc = fx_corrected[i]
-
-            # Apply Dirichlet BC
-            A[i, :] = 0
-            A[i, i] = 1
-            b[i] = h_bc
+        # Apply boundary conditions
+        bcs = get_current_bcs()
+        for node, value in bcs:
+            A[node, :] = 0
+            A[node, node] = 1
+            b[node] = value
 
         # Solve system
-        r_new = spsolve(A.tocsr(), b)
+        h_new = spsolve(A.tocsr(), b)
 
-        # FORTRAN convergence check and relaxation (lines 430-440)
-        ifirst = 1
-        dhmax = 0.0
-
-        for i in range(n_nodes):
-            # Apply relaxation (line 430)
-            if k > 1:
-                r_new[i] = r_new[i] * relax + hlast[i] * (1 - relax)
-
-            # Check if head >= elevation (line 430-440)
-            if r_new[i] >= y[i]:
-                dh = abs(r_new[i] - hlast[i]) if k > 1 else 0
-                dhmax = max(dhmax, dh)
-            else:
-                ifirst = 0  # At least one node below ground
-
-        # Update hlast (line 450)
-        hlast = r.copy()
-
-        # FORTRAN exit face node updates (lines 460-480)
-        for i in range(n_nodes):
-            if nbc[i] != 2:  # Only exit face nodes
-                continue
-
-            if count[i] == 0:  # Inactive exit face
-                if r_new[i] >= y[i] - 0.01:  # Becomes wet
-                    count[i] = 1.0
-                    r_new[i] = y[i]
-                    hlast[i] = y[i]
-                    print(f"  Activated exit face node {i}")
-            else:  # Active exit face
-                if r_new[i] < y[i]:
-                    r_new[i] = y[i]  # Force to elevation
-
-        # Update solution
-        r = r_new.copy()
-
-        # FORTRAN convergence logic (CORRECT VERSION)
-        print(f"  dhmax = {dhmax:.6e}, eps = {eps:.6e}, relax = {relax:.3f}")
-
-        if dhmax > eps:
-            iconv = 0  # Reset counter
+        # *** KEY FIX 3: Add adaptive relaxation factor ***
+        if iteration >= 140:
+            relax = 0.005  # Even more aggressive for final convergence
+        elif iteration >= 120:
+            relax = 0.01
+        elif iteration >= 100:
+            relax = 0.02
+        elif iteration >= 80:
+            relax = 0.05
+        elif iteration >= 60:
+            relax = 0.1
+        elif iteration >= 40:
+            relax = 0.2
+        elif iteration >= 20:
+            relax = 0.5
         else:
-            iconv += 1  # Increment counter
+            relax = 1.0
 
-        print(f"  iconv = {iconv} (need 2 consecutive for convergence)")
+        # Apply relaxation
+        h_relaxed = relax * h_new + (1.0 - relax) * h
 
-        if iconv == 2:
-            print(f"FORTRAN convergence: 2 consecutive iterations with dhmax ≤ eps")
+        # Check convergence
+        residual = np.max(np.abs(h_relaxed - h))
+
+        # Count active boundary conditions for debugging
+        n_fixed = sum(1 for i, _ in bcs if nbc[i] == 1)
+        n_exit = sum(1 for i, _ in bcs if nbc[i] == 2)
+        n_exit_total = sum(1 for i in range(n_nodes) if nbc[i] == 2)
+
+        print(f"Iteration {iteration + 1}: residual = {residual:.6e}, relax = {relax:.3f}")
+        print(f"  BCs: {n_fixed} fixed head, {n_exit}/{n_exit_total} exit face active")
+
+        if residual < tol:
+            print(f"Converged in {iteration + 1} iterations!")
+            h = h_relaxed
             break
 
-        # Early exit for ifirst=1 (all nodes above ground - rare in unsaturated flow)
-        if ifirst == 1:
-            print(f"FORTRAN early exit: all nodes above ground surface")
-            break
+        h = h_relaxed
 
     else:
-        print(f"WARNING: Did not converge after {max_iter} iterations, dhmax = {dhmax:.6e}")
+        print(f"Warning: Did not converge in {max_iter} iterations")
 
-    # Final flow computation
-    A_final = A.copy()
-    q = A_final.tocsr() @ r
+    # Final solve for nodal flows
+    A_full = A.copy()
+    bcs = get_current_bcs()
+    for node, value in bcs:
+        A[node, :] = 0
+        A[node, node] = 1
+        b[node] = value
 
-    return r, A_final, q
+    h_final = spsolve(A.tocsr(), b)
+    q = A_full.tocsr() @ h_final
+
+    return h_final, A, q
 
 
 def kr_frontal(p, kr0, h0):
     """
-    FORTRAN fkrelf function - relative permeability for linear frontal model
+    Fortran-compatible relative permeability function (front model).
+    This matches the fkrelf function in the Fortran code exactly.
     """
-    import numpy as np
-    p = np.asarray(p)
-    kr = np.ones_like(p)
-
-    # Saturated: p >= 0, kr = 1.0
-    # Transition: h0 < p < 0, linear
-    # Dry: p <= h0, kr = kr0
-
-    mask_transition = (p < 0) & (p > h0)
-    mask_dry = (p <= h0)
-
-    kr[mask_transition] = kr0 + (1 - kr0) * p[mask_transition] / h0
-    kr[mask_dry] = kr0
-
-    return kr
+    if p >= 0.0:
+        return 1.0
+    elif p > h0:
+        return kr0 + (1.0 - kr0) * p / h0
+    else:
+        return kr0
 
 def create_flow_potential_bc(coords, elements, q, debug=False):
     """
