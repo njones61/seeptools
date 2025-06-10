@@ -88,8 +88,6 @@ plot_mesh(model.coords, model.elements, model.element_materials,
 
 
 
-
-
 # Plot solution
 plot_solution(model.coords,
               model.elements,

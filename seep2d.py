@@ -278,8 +278,8 @@ def read_seep2d_input(filepath):
             x = float(line[10:25])
             y = float(line[25:40])
 
-            if bc_type == 1 and len(line) >= 54:
-                fx_val = float(line[40:54])
+            if bc_type == 1 and len(line) >= 41:
+                fx_val = float(line[40:55])
             elif bc_type == 2:
                 fx_val = y
             else:
@@ -712,11 +712,11 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.001, h0=-1.0,
         print("  - Incorrect boundary identification")
         print("  - Numerical issues in the flow solution")
 
-    # After convergence or last iteration, print diagnostics
-    if iteration == max_iter or residual < eps:
-        kr_vals = [d['kr_elem'] for d in kr_diagnostics]
-        centroids = np.mean(coords[elements], axis=1)
-        plot_kr_field(coords, elements, kr_vals, title=f'Kr Field (iteration {iteration})')
+    # # After convergence or last iteration, print diagnostics
+    # if iteration == max_iter or residual < eps:
+    #     kr_vals = [d['kr_elem'] for d in kr_diagnostics]
+    #     centroids = np.mean(coords[elements], axis=1)
+    #     plot_kr_field(coords, elements, kr_vals, title=f'Kr Field (iteration {iteration})')
 
     return h, A_csr, q_final
 
@@ -1145,9 +1145,11 @@ def compare_python_fortran_nodal_results(python_head, python_q, fortran_out_path
         'Python_Head': python_head[:n_compare],
         'FORTRAN_Head': fortran_head[:n_compare],
         'Head_Diff': head_diff,
+        'Abs(Head_Diff)': np.abs(head_diff),
         'Python_Q': python_q[:n_compare],
         'FORTRAN_Q': fortran_flow[:n_compare],
-        'Q_Diff': q_diff
+        'Q_Diff': q_diff,
+        'Abs(Q_Diff)': np.abs(q_diff)
     })
 
     # Add summary statistics
