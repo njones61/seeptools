@@ -4,8 +4,8 @@ import numpy as np
 
 # Load input
 model = Seep2D()
-model_data = read_seep2d_input("samples/s2unc/s2unc.s2d")
-#model_data = read_seep2d_input("samples/s2con/s2con.s2d")
+#model_data = read_seep2d_input("samples/s2unc/s2unc.s2d")
+model_data = read_seep2d_input("samples/s2con/s2con.s2d")
 
 # Populate model with input data
 model.coords = model_data["coords"]
@@ -47,7 +47,7 @@ plot_solution(model.coords,
               model.solution["head"],
               phi=model.solution["phi"],
               flowrate=model.solution["flowrate"],
-              base_mat=2,  # assuming material ID 1 is the base material
+              base_mat=1,  # assuming material ID 1 is the base material
               k1_by_mat=model.k1_by_mat,
               fill_contours=False,  # Set to False for black lines only
               phreatic=True,       # Set to False to hide phreatic surface

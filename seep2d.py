@@ -140,7 +140,7 @@ class Seep2D:
             head, A, q, total_flow = solve_confined(self.coords, self.elements, self.nbc, bcs, k1, k2, angle)
             # Solve for potential function φ for flow lines
             dirichlet_phi_bcs = create_flow_potential_bc(self.coords, self.elements, q)
-            phi = solve_flow_function_confined(self.coords, self.elements, dirichlet_phi_bcs)
+            phi = solve_flow_function_confined(self.coords, self.elements, k1, k2, angle, dirichlet_phi_bcs)
             print(f"phi min: {np.min(phi):.3f}, max: {np.max(phi):.3f}")
 
         gamma_w = self.unit_weight
@@ -852,29 +852,32 @@ def create_flow_potential_bc(coords, elements, q, debug=False):
 
     return list(phi.items())
 
-def solve_flow_function_confined(coords, elements, dirichlet_nodes):
+def solve_flow_function_confined(coords, elements, k1_vals, k2_vals, angles, dirichlet_nodes):
     """
     Solves Laplace equation for flow function Phi on the same mesh,
     assigning Dirichlet values along no-flow boundaries.
-
+    Assembles the element matrix using the inverse of Kmat for each element.
+    
     Parameters:
         coords : (n_nodes, 2) array of node coordinates
         elements : (n_elements, 3) triangle node indices
-        velocity : (n_nodes, 2) Darcy velocity vectors (currently unused)
+        k1_vals : (n_elements,) or scalar, major axis conductivity
+        k2_vals : (n_elements,) or scalar, minor axis conductivity
+        angles : (n_elements,) or scalar, angle in degrees (from x-axis)
         dirichlet_nodes : list of (node_id, phi_value)
-
     Returns:
         phi : (n_nodes,) stream function (flow function) values
     """
 
     from scipy.sparse import lil_matrix
     from scipy.sparse.linalg import spsolve
+    import numpy as np
 
     n_nodes = coords.shape[0]
     A = lil_matrix((n_nodes, n_nodes))
     b = np.zeros(n_nodes)
 
-    for tri in elements:
+    for idx, tri in enumerate(elements):
         i, j, k = tri
         xi, yi = coords[i]
         xj, yj = coords[j]
@@ -888,7 +891,18 @@ def solve_flow_function_confined(coords, elements, dirichlet_nodes):
         gamma = np.array([xk - xj, xi - xk, xj - xi])
         grad = np.array([beta, gamma]) / (2 * area)
 
-        ke = area * grad.T @ grad  # Isotropic Laplace stiffness
+        # Get anisotropic conductivity for this element
+        k1 = k1_vals[idx] if hasattr(k1_vals, '__len__') else k1_vals
+        k2 = k2_vals[idx] if hasattr(k2_vals, '__len__') else k2_vals
+        theta = angles[idx] if hasattr(angles, '__len__') else angles
+
+        theta_rad = np.radians(theta)
+        c, s = np.cos(theta_rad), np.sin(theta_rad)
+        R = np.array([[c, s], [-s, c]])
+        Kmat = R.T @ np.diag([k1, k2]) @ R
+
+        # Assemble using the inverse of Kmat
+        ke = area * grad.T @ np.linalg.inv(Kmat) @ grad
 
         for a in range(3):
             for b_ in range(3):
