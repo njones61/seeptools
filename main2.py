@@ -1,4 +1,4 @@
-from seep2d import Seep2D, read_seep2d_input, diagnose_exit_face, compare_python_fortran_nodal_results
+from seep2d import Seep2D, read_seep2d_input
 from plot import plot_mesh, plot_solution
 import numpy as np
 
@@ -27,14 +27,6 @@ model.export_path = "solution.csv"
 model.run_analysis()
 
 
-# # Compare with FORTRAN results
-# compare_python_fortran_nodal_results(
-#     python_head=model.solution["head"],
-#     python_q=model.solution["q"],
-#     fortran_out_path="samples/s2unc/s2unc.out",
-#     nbc=model.nbc
-# )
-
 # Plot mesh
 # plot_mesh(model.coords, model.elements, model.element_materials,
 #           show_nodes=True, show_bc=True, nbc=model.nbc)
@@ -49,10 +41,9 @@ plot_solution(model.coords,
               flowrate=model.solution["flowrate"],
               base_mat=1,  # assuming material ID 1 is the base material
               k1_by_mat=model.k1_by_mat,
-              fill_contours=False,  # Set to False for black lines only
+              fill_contours=True,  # Set to False for black lines only
               phreatic=True,       # Set to False to hide phreatic surface
               element_materials=model.element_materials)  # Add material coloring
 
-# Plot flownet
-#plot_flownet(model.coords, model.elements, model.solution["head"], model.solution["phi"], flowrate=model.solution["flowrate"])
+
 
