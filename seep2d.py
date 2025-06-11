@@ -119,7 +119,7 @@ class Seep2D:
             kr0_per_element = self.kr0_by_mat[mat_ids]
             h0_per_element = self.h0_by_mat[mat_ids]
 
-            head, A, q = solve_unsaturated(
+            head, A, q, total_flow = solve_unsaturated(
                 coords=self.coords,
                 elements=self.elements,
                 nbc=self.nbc,
@@ -132,34 +132,20 @@ class Seep2D:
                 max_iter=200,
                 tol=1e-4
             )
+            # Solve for potential function φ for flow lines
+            dirichlet_phi_bcs = create_flow_potential_bc(self.coords, self.elements, q)
+            phi = solve_flow_function_unsaturated(self.coords, self.elements, head, k1, k2, angle, kr0_per_element, h0_per_element, dirichlet_phi_bcs)
+            print(f"phi min: {np.min(phi):.3f}, max: {np.max(phi):.3f}")
         else:
-            head, A, q = solve_confined(self.coords, self.elements, bcs, k1, k2, angle)
+            head, A, q, total_flow = solve_confined(self.coords, self.elements, self.nbc, bcs, k1, k2, angle)
+            # Solve for potential function φ for flow lines
+            dirichlet_phi_bcs = create_flow_potential_bc(self.coords, self.elements, q)
+            phi = solve_flow_function_confined(self.coords, self.elements, dirichlet_phi_bcs)
+            print(f"phi min: {np.min(phi):.3f}, max: {np.max(phi):.3f}")
 
         gamma_w = self.unit_weight
         pressure = gamma_w * (head - self.coords[:, 1])
         velocity = compute_velocity(self.coords, self.elements, head, k1, k2, angle)
-
-        # Print indices and values of nodes included in the total flow sum
-        included_nodes = []
-        total_flow = 0.0
-        
-        print("\n=== Flow Balance Analysis ===")
-        print("\nNodes with positive flow (q > 0):")
-        for node_idx in range(len(self.nbc)):
-            if q[node_idx] > 0:  # Positive flow
-                included_nodes.append(node_idx)
-                total_flow += q[node_idx]
-                bc_type = "Fixed Head" if self.nbc[node_idx] == 1 else "Exit Face"
-                print(f"  Node {node_idx+1} ({bc_type}): q = {q[node_idx]:.6f}")
-
-        print("\nFlow Summary:")
-        print(f"Total flow: {total_flow:.6f}")
-
-        # Solve for potential function φ for flow lines
-        dirichlet_phi_bcs = create_flow_potential_bc(self.coords, self.elements, q)
-        phi = solve_flow_function(self.coords, self.elements, velocity, dirichlet_phi_bcs)
-
-        print(f"phi min: {np.min(phi):.3f}, max: {np.max(phi):.3f}")
 
         self.solution = {
             "head": head,
@@ -173,10 +159,8 @@ class Seep2D:
         if hasattr(self, "export_path"):
             export_solution_csv(self.export_path, self.coords, head, pressure, velocity, q, phi, total_flow)
 
-        print("Sum of all nodal flows:", np.sum(q))
-        print("Max abs interior node flow:", np.max(np.abs(q[(self.nbc != 1) & (self.nbc != 2)])))
-        print("Sum of positive flows (all nodes):", np.sum(q[q > 0]))
-        print("Sum of positive flows (boundary nodes):", np.sum(q[(q > 0) & ((self.nbc == 1) | (self.nbc == 2))]))
+        # After computing nodal flows
+        #debug_nodal_flows_above_phreatic(self.coords, head, q, title='Nodal Flows vs Phreatic Surface')
 
     def save_results(self, filename):
         print(f"Saving results to {filename}")
@@ -351,7 +335,8 @@ def load_solution_csv(filename):
     velocity = df[["vx", "vy"]].values
     return coords, head, pressure, velocity
 
-def solve_confined(coords, elements, dirichlet_bcs, k1_vals, k2_vals, angles=None):
+
+def solve_confined(coords, elements, nbc, dirichlet_bcs, k1_vals, k2_vals, angles=None):
     """
     FEM solver for confined seepage with anisotropic conductivity.
     Parameters:
@@ -414,82 +399,15 @@ def solve_confined(coords, elements, dirichlet_bcs, k1_vals, k2_vals, angles=Non
     head = spsolve(A.tocsr(), b)
     q = A_full.tocsr() @ head
 
-    return head, A, q
 
+    total_flow = 0.0
 
-def compute_nodal_flows(coords, elements, head, k1_vals, k2_vals, angles, kr0, h0):
-    """
-    Compute nodal flows by assembling element-wise contributions, matching FORTRAN logic.
-    This version more closely follows the FORTRAN implementation in seep2d.f.
-    """
-    import numpy as np
-    n_nodes = coords.shape[0]
-    q = np.zeros(n_nodes)
-    y = coords[:, 1]
-    p_nodes = head - y
+    for node_idx in range(len(nbc)):
+        if q[node_idx] > 0:  # Positive flow
+            total_flow += q[node_idx]
 
-    # Get maximum conductivity for scaling (matching FORTRAN's sck)
-    max_k = max(np.max(k1_vals), np.max(k2_vals))
+    return head, A, q, total_flow   
 
-    # Scale conductivities down (matching FORTRAN's sc = 1.0/sck)
-    k1_scaled = k1_vals / max_k
-    k2_scaled = k2_vals / max_k
-
-    # First pass: compute element stiffness matrices and store them
-    element_stiffness = []
-    for idx, tri in enumerate(elements):
-        i, j, k = tri
-        xi, yi = coords[i]
-        xj, yj = coords[j]
-        xk, yk = coords[k]
-
-        area = 0.5 * abs((xj - xi) * (yk - yi) - (xk - xi) * (yj - yi))
-        if area <= 0:
-            element_stiffness.append(None)
-            continue
-
-        beta = np.array([yj - yk, yk - yi, yi - yj])
-        gamma = np.array([xk - xj, xi - xk, xj - xi])
-        grad = np.array([beta, gamma]) / (2 * area)
-
-        # Get material properties for this element
-        k1 = k1_scaled[idx] if hasattr(k1_scaled, '__len__') else k1_scaled
-        k2 = k2_scaled[idx] if hasattr(k2_scaled, '__len__') else k2_scaled
-        theta = angles[idx] if hasattr(angles, '__len__') else angles
-
-        theta_rad = np.radians(theta)
-        c, s = np.cos(theta_rad), np.sin(theta_rad)
-        R = np.array([[c, s], [-s, c]])
-        Kmat = R.T @ np.diag([k1, k2]) @ R
-
-        # Compute element pressure (centroid)
-        p_elem = (p_nodes[i] + p_nodes[j] + p_nodes[k]) / 3.0
-        kr_elem = kr_frontal(p_elem, kr0[idx], h0[idx])
-
-        # Element stiffness matrix with kr
-        ke = kr_elem * area * grad.T @ Kmat @ grad
-        element_stiffness.append(ke)
-
-    # Second pass: compute flows using stored stiffness matrices
-    for idx, tri in enumerate(elements):
-        ke = element_stiffness[idx]
-        if ke is None:
-            continue
-
-        i, j, k = tri
-        h_elem = head[[i, j, k]]
-        
-        # Local flow vector for this element: f = ke @ h_elem
-        f_elem = ke @ h_elem
-
-        # Distribute to nodes (FORTRAN logic: add to each node)
-        for local, global_node in enumerate([i, j, k]):
-            q[global_node] += f_elem[local]
-
-    # Scale flows back up (matching FORTRAN's flowsc = flow * sck)
-    q = q * max_k
-
-    return q
 
 def solve_unsaturated(coords, elements, nbc, fx, kr0=0.001, h0=-1.0,
                       k1_vals=1.0, k2_vals=1.0, angles=0.0,
@@ -683,10 +601,8 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.001, h0=-1.0,
             if i % 20 == 0 or i == len(residuals) - 1:
                 print(f"  Iteration {i+1}: residual = {r:.6e}")
 
-    # Final flow computation with converged heads (FORTRAN-style)
-    q_final = compute_nodal_flows(
-        coords, elements, h, k1_vals, k2_vals, angles, kr0, h0
-    )
+
+    q_final = q
 
     # Flow potential closure check - FORTRAN-style
     total_inflow = 0.0
@@ -696,6 +612,8 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.001, h0=-1.0,
         if nbc[node_idx] == 1:  # Fixed head boundary
             if q_final[node_idx] > 0:
                 total_inflow += q_final[node_idx]
+            elif q_final[node_idx] < 0:
+                total_outflow -= q_final[node_idx]
         elif nbc[node_idx] == 2 and exit_face_active[node_idx]:  # Active exit face
             if q_final[node_idx] < 0:
                 total_outflow -= q_final[node_idx]
@@ -712,13 +630,8 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.001, h0=-1.0,
         print("  - Incorrect boundary identification")
         print("  - Numerical issues in the flow solution")
 
-    # # After convergence or last iteration, print diagnostics
-    # if iteration == max_iter or residual < eps:
-    #     kr_vals = [d['kr_elem'] for d in kr_diagnostics]
-    #     centroids = np.mean(coords[elements], axis=1)
-    #     plot_kr_field(coords, elements, kr_vals, title=f'Kr Field (iteration {iteration})')
 
-    return h, A_csr, q_final
+    return h, A_csr, q_final, total_inflow
 
 def kr_frontal(p, kr0, h0):
     """
@@ -938,7 +851,8 @@ def create_flow_potential_bc(coords, elements, q, debug=False):
         print("✓ Flow potential BC creation succeeded")
 
     return list(phi.items())
-def solve_flow_function(coords, elements, velocity, dirichlet_nodes):
+
+def solve_flow_function_confined(coords, elements, dirichlet_nodes):
     """
     Solves Laplace equation for flow function Phi on the same mesh,
     assigning Dirichlet values along no-flow boundaries.
@@ -975,6 +889,69 @@ def solve_flow_function(coords, elements, velocity, dirichlet_nodes):
         grad = np.array([beta, gamma]) / (2 * area)
 
         ke = area * grad.T @ grad  # Isotropic Laplace stiffness
+
+        for a in range(3):
+            for b_ in range(3):
+                A[tri[a], tri[b_]] += ke[a, b_]
+
+    for node, phi_value in dirichlet_nodes:
+        A[node, :] = 0
+        A[node, node] = 1
+        b[node] = phi_value
+
+    phi = spsolve(A.tocsr(), b)
+    return phi
+
+def solve_flow_function_unsaturated(coords, elements, head, k1_vals, k2_vals, angles, kr0, h0, dirichlet_nodes):
+    """
+    Solves the flow function Phi using the correct ke for unsaturated flow.
+    For flowlines, assemble the element matrix using the inverse of kr_elem and Kmat, matching the FORTRAN logic.
+    """
+    from scipy.sparse import lil_matrix
+    from scipy.sparse.linalg import spsolve
+    import numpy as np
+
+    n_nodes = coords.shape[0]
+    A = lil_matrix((n_nodes, n_nodes))
+    b = np.zeros(n_nodes)
+
+    y = coords[:, 1]
+    p_nodes = head - y
+
+    for idx, tri in enumerate(elements):
+        i, j, k = tri
+        xi, yi = coords[i]
+        xj, yj = coords[j]
+        xk, yk = coords[k]
+
+        area = 0.5 * abs((xj - xi) * (yk - yi) - (xk - xi) * (yj - yi))
+        if area <= 0:
+            continue
+
+        beta = np.array([yj - yk, yk - yi, yi - yj])
+        gamma = np.array([xk - xj, xi - xk, xj - xi])
+        grad = np.array([beta, gamma]) / (2 * area)  # grad is (2,3)
+
+        # Get material properties for this element
+        k1 = k1_vals[idx] if hasattr(k1_vals, '__len__') else k1_vals
+        k2 = k2_vals[idx] if hasattr(k2_vals, '__len__') else k2_vals
+        theta = angles[idx] if hasattr(angles, '__len__') else angles
+
+        theta_rad = np.radians(theta)
+        c, s = np.cos(theta_rad), np.sin(theta_rad)
+        R = np.array([[c, s], [-s, c]])
+        Kmat = R.T @ np.diag([k1, k2]) @ R  # Kmat is (2,2)
+
+        # Compute element pressure (centroid)
+        p_elem = (p_nodes[i] + p_nodes[j] + p_nodes[k]) / 3.0
+        kr_elem = kr_frontal(p_elem, kr0[idx], h0[idx])
+
+        # Assemble using the inverse of kr_elem and Kmat
+        # If kr_elem is very small, avoid division by zero
+        if kr_elem > 1e-12:
+            ke = (1.0 / kr_elem) * area * grad.T @ np.linalg.inv(Kmat) @ grad
+        else:
+            ke = 1e12 * area * grad.T @ np.linalg.inv(Kmat) @ grad  # Large value for near-zero kr
 
         for a in range(3):
             for b_ in range(3):
@@ -1272,3 +1249,182 @@ def plot_kr_field(coords, elements, kr_vals, title='Kr Field'):
     plt.gca().set_aspect('equal')
     plt.tight_layout()
     plt.show()
+
+def plot_nodal_flows(coords, q, title='Nodal Flow Values', show_values=False, cmap='RdBu_r'):
+    """
+    Plot nodal flow values for debugging.
+    
+    Parameters:
+    -----------
+    coords : ndarray
+        Node coordinates array (n_nodes x 2)
+    q : ndarray
+        Nodal flow values array (n_nodes)
+    title : str, optional
+        Plot title
+    show_values : bool, optional
+        Whether to show the actual flow values on the plot
+    cmap : str, optional
+        Colormap to use for the scatter plot
+    """
+    plt.figure(figsize=(10, 8))
+    
+    # Create scatter plot of nodes colored by flow value
+    scatter = plt.scatter(coords[:, 0], coords[:, 1], 
+                         c=q, cmap=cmap, 
+                         s=100, edgecolor='k')
+    
+    # Add colorbar
+    cbar = plt.colorbar(scatter)
+    cbar.set_label('Flow Value')
+    
+    # Add node numbers and flow values if requested
+    if show_values:
+        for i, (x, y) in enumerate(coords):
+            plt.text(x, y, f'Node {i+1}\n{q[i]:.2e}', 
+                    ha='center', va='center',
+                    fontsize=8)
+    
+    plt.title(title)
+    plt.xlabel('X')
+    plt.ylabel('Y')
+    plt.grid(True)
+    plt.axis('equal')
+    
+    return plt.gcf()
+
+def classify_nodes_by_phreatic_surface(coords, head):
+    """
+    Returns a boolean mask: True if node is above the phreatic surface (unsaturated), False otherwise.
+    """
+    return head < coords[:, 1]
+
+def debug_nodal_flows_above_phreatic(coords, head, q, title='Nodal Flows vs Phreatic Surface'):
+    above_mask = classify_nodes_by_phreatic_surface(coords, head)
+    below_mask = ~above_mask
+
+    # Print summary statistics
+    print(f'Nodes above phreatic surface: {np.sum(above_mask)}')
+    print(f'Nodes below phreatic surface: {np.sum(below_mask)}')
+    print('--- Above phreatic surface ---')
+    print(f'Max |q|: {np.max(np.abs(q[above_mask])):.3e}')
+    print(f'Mean |q|: {np.mean(np.abs(q[above_mask])):.3e}')
+    print(f'Min |q|: {np.min(np.abs(q[above_mask])):.3e}')
+    print('--- Below phreatic surface ---')
+    print(f'Max |q|: {np.max(np.abs(q[below_mask])):.3e}')
+    print(f'Mean |q|: {np.mean(np.abs(q[below_mask])):.3e}')
+    print(f'Min |q|: {np.min(np.abs(q[below_mask])):.3e}')
+
+    # Plot
+    plt.figure(figsize=(10, 8))
+    plt.scatter(coords[below_mask, 0], coords[below_mask, 1], c=q[below_mask], cmap='Blues', label='Below Phreatic', s=60)
+    plt.scatter(coords[above_mask, 0], coords[above_mask, 1], c=q[above_mask], cmap='Reds', label='Above Phreatic', s=60, marker='^')
+    plt.colorbar(label='Nodal q')
+    plt.legend()
+    plt.title(title)
+    plt.xlabel('X')
+    plt.ylabel('Y')
+    plt.grid(True)
+    plt.axis('equal')
+    plt.show()
+
+def debug_kr_above_phreatic(coords, head, kr, title='kr vs Phreatic Surface'):
+    """
+    Plot and summarize kr values above and below the phreatic surface.
+    coords: (n_nodes, 2) array of node coordinates
+    head: (n_nodes,) array of nodal heads
+    kr: (n_nodes,) array of nodal kr values
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    above_mask = classify_nodes_by_phreatic_surface(coords, head)
+    below_mask = ~above_mask
+
+    # Print summary statistics
+    print(f'Nodes above phreatic surface: {np.sum(above_mask)}')
+    print(f'Nodes below phreatic surface: {np.sum(below_mask)}')
+    print('--- Above phreatic surface ---')
+    print(f'Max kr: {np.max(kr[above_mask]):.3e}')
+    print(f'Mean kr: {np.mean(kr[above_mask]):.3e}')
+    print(f'Min kr: {np.min(kr[above_mask]):.3e}')
+    print('--- Below phreatic surface ---')
+    print(f'Max kr: {np.max(kr[below_mask]):.3e}')
+    print(f'Mean kr: {np.mean(kr[below_mask]):.3e}')
+    print(f'Min kr: {np.min(kr[below_mask]):.3e}')
+
+    # Plot
+    plt.figure(figsize=(10, 8))
+    plt.scatter(coords[below_mask, 0], coords[below_mask, 1], c=kr[below_mask], cmap='Blues', label='Below Phreatic', s=60)
+    plt.scatter(coords[above_mask, 0], coords[above_mask, 1], c=kr[above_mask], cmap='Reds', label='Above Phreatic', s=60, marker='^')
+    plt.colorbar(label='kr')
+    plt.legend()
+    plt.title(title)
+    plt.xlabel('X')
+    plt.ylabel('Y')
+    plt.grid(True)
+    plt.axis('equal')
+    plt.show()
+
+def debug_kr_elements(coords, elements, head, kr_elem, title='Element kr vs Phreatic Surface'):
+    """
+    Plot and summarize kr values at the element level, classified by phreatic surface.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import PolyCollection
+
+    # Compute average head and average elevation for each element
+    avg_head = np.mean(head[elements], axis=1)
+    avg_elev = np.mean(coords[elements, 1], axis=1)
+    above_mask = avg_head < avg_elev
+    below_mask = ~above_mask
+
+    print(f'Elements above phreatic surface: {np.sum(above_mask)}')
+    print(f'Elements below phreatic surface: {np.sum(below_mask)}')
+    print('--- Above phreatic surface ---')
+    print(f'Max kr: {np.max(kr_elem[above_mask]):.3e}')
+    print(f'Mean kr: {np.mean(kr_elem[above_mask]):.3e}')
+    print(f'Min kr: {np.min(kr_elem[above_mask]):.3e}')
+    print('--- Below phreatic surface ---')
+    print(f'Max kr: {np.max(kr_elem[below_mask]):.3e}')
+    print(f'Mean kr: {np.mean(kr_elem[below_mask]):.3e}')
+    print(f'Min kr: {np.min(kr_elem[below_mask]):.3e}')
+
+    # Plot
+    verts = [coords[tri] for tri in elements]
+    fig, ax = plt.subplots(figsize=(10, 8))
+    pc = PolyCollection(verts, array=kr_elem, cmap='viridis', edgecolor='k')
+    ax.add_collection(pc)
+    ax.autoscale()
+    plt.colorbar(pc, ax=ax, label='kr')
+    plt.title(title)
+    plt.xlabel('X')
+    plt.ylabel('Y')
+    plt.grid(True)
+    plt.show()
+
+def debug_ke_elements(coords, elements, head, ke_list, title='Element ke vs Phreatic Surface'):
+    """
+    Print and compare the norm of ke for elements above vs below the phreatic surface.
+    ke_list: list or array of 3x3 element stiffness matrices
+    """
+    import numpy as np
+    # Compute average head and average elevation for each element
+    avg_head = np.mean(head[elements], axis=1)
+    avg_elev = np.mean(coords[elements, 1], axis=1)
+    above_mask = avg_head < avg_elev
+    below_mask = ~above_mask
+
+    # Compute Frobenius norm of each ke
+    ke_norms = np.array([np.linalg.norm(ke) if ke is not None else np.nan for ke in ke_list])
+
+    print(f'Elements above phreatic surface: {np.sum(above_mask)}')
+    print(f'Elements below phreatic surface: {np.sum(below_mask)}')
+    print('--- Above phreatic surface ---')
+    print(f'Max ke norm: {np.nanmax(ke_norms[above_mask]):.3e}')
+    print(f'Mean ke norm: {np.nanmean(ke_norms[above_mask]):.3e}')
+    print(f'Min ke norm: {np.nanmin(ke_norms[above_mask]):.3e}')
+    print('--- Below phreatic surface ---')
+    print(f'Max ke norm: {np.nanmax(ke_norms[below_mask]):.3e}')
+    print(f'Mean ke norm: {np.nanmean(ke_norms[below_mask]):.3e}')
+    print(f'Min ke norm: {np.nanmin(ke_norms[below_mask]):.3e}')

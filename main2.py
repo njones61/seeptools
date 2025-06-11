@@ -23,68 +23,21 @@ model.unit_weight = model_data["unit_weight"]
 model.export_path = "solution.csv"
 
 
-# Add these debug prints to main2.py after loading the model data
-
-# print("\n=== Material Properties Debug ===")
-# print(f"Number of materials: {len(model.k1_by_mat)}")
-# for i, (k1, k2, angle, kr0, h0) in enumerate(zip(
-#     model.k1_by_mat, model.k2_by_mat, model.angle_by_mat,
-#     model.kr0_by_mat, model.h0_by_mat)):
-#     print(f"Material {i+1}: k1={k1}, k2={k2}, angle={angle}, kr0={kr0}, h0={h0}")
-
-# print("\n=== Boundary Conditions Debug ===")
-# print(f"Total nodes: {len(model.nbc)}")
-# print(f"Fixed head nodes (nbc=1): {np.sum(model.nbc == 1)}")
-# print(f"Exit face nodes (nbc=2): {np.sum(model.nbc == 2)}")
-# print(f"No-flow nodes (nbc=0): {np.sum(model.nbc == 0)}")
-
-# # Check head values at boundaries
-# fixed_heads = [(i, model.fx[i]) for i in range(len(model.nbc)) if model.nbc[i] == 1]
-# print(f"\nFixed head values: min={min(h for _, h in fixed_heads):.3f}, max={max(h for _, h in fixed_heads):.3f}")
-
-# exit_elevations = [(i, model.coords[i,1]) for i in range(len(model.nbc)) if model.nbc[i] == 2]
-# if exit_elevations:
-#     print(f"Exit face elevations: min={min(y for _, y in exit_elevations):.3f}, max={max(y for _, y in exit_elevations):.3f}")
-
-# print("\n=== Element Materials Debug ===")
-# unique_mats, counts = np.unique(model.element_materials, return_counts=True)
-# for mat, count in zip(unique_mats, counts):
-#     print(f"Material {mat}: {count} elements")
-
-# # Check for any zero or negative conductivities
-# k1_arr = model.k1_by_mat[model.element_materials - 1]
-# k2_arr = model.k2_by_mat[model.element_materials - 1]
-# if np.any(k1_arr <= 0) or np.any(k2_arr <= 0):
-#     print("\nWARNING: Found zero or negative conductivities!")
-#     print(f"k1 range: [{np.min(k1_arr)}, {np.max(k1_arr)}]")
-#     print(f"k2 range: [{np.min(k2_arr)}, {np.max(k2_arr)}]")
-
-
 # Run solver
 model.run_analysis()
 
-# Debug prints for nbc array
-print("\n=== Debug: Boundary Conditions in main2.py ===")
-print(f"nbc type: {type(model.nbc)}")
-print(f"nbc shape: {model.nbc.shape if hasattr(model.nbc, 'shape') else len(model.nbc)}")
-print(f"nbc dtype: {model.nbc.dtype if hasattr(model.nbc, 'dtype') else type(model.nbc[0])}")
-print(f"nbc unique values: {np.unique(model.nbc)}")
-print(f"nbc first 10 values: {model.nbc[:10]}")
-print(f"Number of interior nodes (0): {np.sum(model.nbc == 0)}")
-print(f"Number of fixed head nodes (1): {np.sum(model.nbc == 1)}")
-print(f"Number of exit face nodes (2): {np.sum(model.nbc == 2)}")
 
-# Compare with FORTRAN results
-compare_python_fortran_nodal_results(
-    python_head=model.solution["head"],
-    python_q=model.solution["q"],
-    fortran_out_path="samples/s2unc/s2unc.out",
-    nbc=model.nbc
-)
+# # Compare with FORTRAN results
+# compare_python_fortran_nodal_results(
+#     python_head=model.solution["head"],
+#     python_q=model.solution["q"],
+#     fortran_out_path="samples/s2unc/s2unc.out",
+#     nbc=model.nbc
+# )
 
 # Plot mesh
-plot_mesh(model.coords, model.elements, model.element_materials,
-          show_nodes=True, show_bc=True, nbc=model.nbc)
+# plot_mesh(model.coords, model.elements, model.element_materials,
+#           show_nodes=True, show_bc=True, nbc=model.nbc)
 
 
 
