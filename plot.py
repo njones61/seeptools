@@ -1,16 +1,25 @@
-
 import matplotlib.pyplot as plt
 import matplotlib.tri as tri
 from matplotlib.ticker import MaxNLocator
 import numpy as np
-from scipy.interpolate import griddata
 
 
-def plot_mesh(coords, elements, element_materials, show_nodes=False, show_bc=False, nbc=None):
+def plot_mesh(seep_data, show_nodes=False, show_bc=False):
     """
     Plots a mesh colored by material zone.
+    
+    Args:
+        seep_data: Dictionary containing seepage data from import_seep2d
+        show_nodes: If True, plot node points
+        show_bc: If True, plot boundary condition nodes
     """
     import matplotlib.pyplot as plt
+
+    # Extract data from seep_data
+    coords = seep_data["coords"]
+    elements = seep_data["elements"]
+    element_materials = seep_data["element_materials"]
+    nbc = seep_data["nbc"]
 
     fig, ax = plt.subplots(figsize=(12, 5))
     materials = np.unique(element_materials)
@@ -30,7 +39,7 @@ def plot_mesh(coords, elements, element_materials, show_nodes=False, show_bc=Fal
         for i, mat in enumerate(materials)
     ]
 
-    if show_bc and nbc is not None:
+    if show_bc:
         bc1 = coords[nbc == 1]
         bc2 = coords[nbc == 2]
         if len(bc1) > 0:
@@ -55,175 +64,32 @@ def plot_mesh(coords, elements, element_materials, show_nodes=False, show_bc=Fal
     plt.show()
 
 
-def plot_solution_OLD(coords, elements, head, flowrate=None, levels=20):
-    """
-    Plots filled contour of total head and overlays solid contour lines.
-    """
-
-    plt.figure(figsize=(12, 5))
-
-    triang = tri.Triangulation(coords[:, 0], coords[:, 1], elements) # Create triangulation from coordinates and elements
-
-    # Filled contours
-    vmin = np.min(head)
-    vmax = np.max(head)
-    contour_levels = np.linspace(vmin, vmax, levels)
-
-    contourf = plt.tricontourf(triang, head, levels=levels, cmap="Spectral_r", vmin=vmin, vmax=vmax)
-
-    # Options for cmap:
-    # plasma, viridis, inferno, magma, cividis, coolwarm, Spectral, Blues, YlGnBu, RdYlBu, etc
-    # Append "_r" to reverse the colormap (e.g., "Spectral_r")
-    # You can also use a custom colormap if desired, e.g., from matplotlib.colors
-
-
-    # Solid contour lines
-    contour = plt.tricontour(triang, head, levels=levels, colors="k", linewidths=0.5)
-
-    # Colorbar with nicely rounded ticks
-    cbar = plt.colorbar(contourf, label="Total Head")
-    cbar.locator = MaxNLocator(nbins=10, steps=[1, 2, 5])  # Pick good-looking tick steps
-    cbar.update_ticks()
-
-    #plt.clabel(contour, inline=True, fontsize=8, fmt="%.2f", colors="k") # Uncomment to label contours
-    #plt.triplot(triang, color="k", linewidth=0.2, alpha=0.4) # Uncomment if you want to show mesh edges
-
-    title = "Total Head Contours"
-    if flowrate is not None:
-        title += f" — Total Flowrate: {flowrate:.3f}"
-    plt.title(title)
-    plt.gca().set_aspect("equal")
-    plt.tight_layout()
-    plt.show()
-
-
-def plot_solution_OLD(coords, elements, head, phi=None, flowrate=None, levels=20, base_mat=None, k1_by_mat=None):
+def plot_solution(seep_data, solution, levels=20, base_mat=None, fill_contours=True, phreatic=True):
     """
     Plots head contours and optionally overlays flowlines (phi) based on flow function.
     Fixed version that properly handles mesh aspect ratio and doesn't clip the plot.
 
     Arguments:
-        coords: (n_nodes, 2) array of node coordinates
-        elements: (n_elements, 3) array of triangle indices
-        head: (n_nodes,) array of total head values
-        phi: (n_nodes,) array of flow potential values (optional)
-        flowrate: total flowrate (optional, required for phi contours)
+        seep_data: Dictionary containing seepage data from import_seep2d
+        solution: Dictionary containing solution results from run_analysis
         levels: number of head contour levels
         base_mat: material ID (1-based) used to compute k for flow function
-        k1_by_mat: (n_materials,) array of k1 values by material ID (required if base_mat is given)
-    """
-    import matplotlib.pyplot as plt
-    import matplotlib.tri as tri
-    from matplotlib.ticker import MaxNLocator
-    import numpy as np
-
-    # Calculate proper figure size based on mesh aspect ratio
-    x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
-    y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
-
-    x_range = x_max - x_min
-    y_range = y_max - y_min
-    mesh_aspect = x_range / y_range if y_range > 0 else 1.0
-
-    # Set figure size to accommodate the mesh properly
-    if mesh_aspect > 2.0:  # Wide mesh
-        fig_width = 12
-        fig_height = 12 / mesh_aspect
-    elif mesh_aspect < 0.5:  # Tall mesh
-        fig_height = 10
-        fig_width = 10 * mesh_aspect
-    else:  # Roughly square mesh
-        fig_width = 10
-        fig_height = 10 / mesh_aspect
-
-    # Ensure minimum size
-    fig_width = max(fig_width, 6)
-    fig_height = max(fig_height, 4)
-
-    print(f"Mesh bounds: x=[{x_min:.1f}, {x_max:.1f}], y=[{y_min:.1f}, {y_max:.1f}]")
-    print(f"Mesh aspect ratio: {mesh_aspect:.2f}, Figure size: {fig_width:.1f} x {fig_height:.1f}")
-
-    triang = tri.Triangulation(coords[:, 0], coords[:, 1], elements)
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-
-    vmin = np.min(head)
-    vmax = np.max(head)
-    hdrop = vmax - vmin
-    contour_levels = np.linspace(vmin, vmax, levels)
-
-    # Filled contours
-    contourf = ax.tricontourf(triang, head, levels=contour_levels, cmap="Spectral_r", vmin=vmin, vmax=vmax, alpha=0.5)
-    cbar = plt.colorbar(contourf, ax=ax, label="Total Head")
-    cbar.locator = MaxNLocator(nbins=10, steps=[1, 2, 5])
-    cbar.update_ticks()
-
-    # Solid lines for head contours
-    ax.tricontour(triang, head, levels=contour_levels, colors="k", linewidths=0.5)
-
-    # Overlay flowlines if phi is available
-    if phi is not None and flowrate is not None and base_mat is not None and k1_by_mat is not None:
-        # Materials are 1-based, so adjust index
-        base_k = k1_by_mat[base_mat - 1]
-        ne = levels - 1
-        nf = (flowrate * ne) / (base_k * hdrop)
-        phi_levels = round(nf) + 1
-        print(f"Computed nf: {nf:.2f}, using {phi_levels} φ contours (base k={base_k}, head drop={hdrop:.3f})")
-        phi_contours = np.linspace(np.min(phi), np.max(phi), phi_levels)
-        ax.tricontour(triang, phi, levels=phi_contours, colors="blue", linewidths=0.7, linestyles="solid")
-
-    # Plot the mesh boundary
-    try:
-        boundary = get_ordered_boundary(coords, elements)
-        ax.plot(boundary[:, 0], boundary[:, 1], color="black", linewidth=1.0, label="Mesh Boundary")
-    except Exception as e:
-        print(f"Warning: Could not plot mesh boundary: {e}")
-
-    # Set explicit axis limits to ensure full mesh is shown
-    margin = 0.10  # 10% margin
-    x_margin = x_range * margin
-    y_margin = y_range * margin
-
-    ax.set_xlim(x_min - x_margin, x_max + x_margin)
-    ax.set_ylim(y_min - y_margin, y_max + y_margin)
-
-    title = "Flow Net: Head Contours"
-    if phi is not None:
-        title += " and Flowlines"
-    if flowrate is not None:
-        title += f" — Total Flowrate: {flowrate:.3f}"
-    ax.set_title(title)
-
-    # Set equal aspect ratio AFTER setting limits
-    ax.set_aspect("equal")
-
-    # Adjust layout to prevent clipping
-    plt.tight_layout()
-    plt.show()
-
-
-def plot_solution(coords, elements, head, phi=None, flowrate=None, levels=20, base_mat=None, k1_by_mat=None,
-                  fill_contours=True, phreatic=True, element_materials=None):
-    """
-    Plots head contours and optionally overlays flowlines (phi) based on flow function.
-    Fixed version that properly handles mesh aspect ratio and doesn't clip the plot.
-
-    Arguments:
-        coords: (n_nodes, 2) array of node coordinates
-        elements: (n_elements, 3) array of triangle indices
-        head: (n_nodes,) array of total head values
-        phi: (n_nodes,) array of flow potential values (optional)
-        flowrate: total flowrate (optional, required for phi contours)
-        levels: number of head contour levels
-        base_mat: material ID (1-based) used to compute k for flow function
-        k1_by_mat: (n_materials,) array of k1 values by material ID (required if base_mat is given)
         fill_contours: bool, if True shows filled contours, if False only black solid lines
         phreatic: bool, if True plots phreatic surface (pressure head = 0) as thick red line
-        element_materials: (n_elements,) array of material IDs for each element (optional)
     """
     import matplotlib.pyplot as plt
     import matplotlib.tri as tri
     from matplotlib.ticker import MaxNLocator
     import numpy as np
+
+    # Extract data from seep_data and solution
+    coords = seep_data["coords"]
+    elements = seep_data["elements"]
+    element_materials = seep_data["element_materials"]
+    k1_by_mat = seep_data["k1_by_mat"]
+    head = solution["head"]
+    phi = solution.get("phi")
+    flowrate = solution.get("flowrate")
 
     # Calculate proper figure size based on mesh aspect ratio
     x_min, x_max = coords[:, 0].min(), coords[:, 0].max()

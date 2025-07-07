@@ -1,14 +1,22 @@
-from mesh_utils import build_tri_mesh_with_regions, plot_mesh, plot_mesh_with_materials
+from seep import import_seep2d, run_analysis, print_seep_data_diagnostics, export_solution_csv
+from plot import plot_mesh, plot_solution
 import numpy as np
 
-# Define two adjacent rectangles
-left_rect = [(0, 0), (1, 0), (1, 1), (0, 1)]
-right_rect = [(1, 0), (2, 0), (2, 1), (1, 1)]
 
-polygons = [left_rect, right_rect]
-region_ids = [1, 2]  # material IDs
-target_size = 0.1
+# Load input
+seep_data = import_seep2d("samples/s2unc/s2unc.s2d")
 
-nodes, elements, mat_ids = build_tri_mesh_with_regions(polygons, region_ids, target_size)
+# Print diagnostics
+# print_seep_data_diagnostics(seep_data)
 
-plot_mesh_with_materials(nodes, elements, mat_ids)
+# Plot mesh
+plot_mesh(seep_data, show_nodes=True, show_bc=True)
+
+# Run analysis
+solution = run_analysis(seep_data)
+
+# Export solution to CSV
+export_solution_csv("seep_solution.csv", seep_data, solution)
+
+# Plot solution
+plot_solution(seep_data, solution, base_mat=1, fill_contours=True, phreatic=True) 

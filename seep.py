@@ -1,202 +1,7 @@
-"""
-SEEP2D Python Translation
--------------------------
-
-Finite element seepage analysis tool originally developed in Fortran.
-Ported to Python for improved modularity and extensibility.
-
-Author (Original): Fred Tracy, ERDC
-Python Port: [Your Name or Group]
-"""
-
 import numpy as np
 import matplotlib.pyplot as plt
 
-
-# Constants (from seep.inc)
-MXNODS = 1000000   # Max number of nodes
-MXELES = 1000000   # Max number of elements
-MXBNDW = 700       # Max matrix bandwidth
-MXMATS = 100       # Max material zones
-
-
-class Seep2D:
-    def __init__(self):
-        # Simulation control flags and metadata
-        self.stayopen = ''
-        self.usegeo = False
-
-        # Problem size (to be set during input)
-        self.num_nodes = 0
-        self.num_elements = 0
-
-        # Data structures
-        self.nodes = np.zeros((MXNODS, 2))        # Node coordinates
-        self.elements = np.zeros((MXELES, 3), dtype=int)  # Element connectivity
-        self.material_ids = np.zeros(MXELES, dtype=int)   # Material ID per element
-
-        # Placeholder: boundary conditions, loads, solution variables, etc.
-        # self.boundary_conditions = ...
-        # self.hydraulic_heads = ...
-
-    def load_input(self, filename):
-        print(f"Loading input from {filename}")
-        import sys
-        import os
-
-        print("Entering seepage analysis")
-
-        if filename == "-getArraySizes":
-            with open("arraySizes.txt", "w") as f:
-                f.write(f"MaxNode     {MXNODS}\n")
-                f.write(f"MaxElement  {MXELES}\n")
-                f.write(f"MaxBandwidth {MXBNDW}\n")
-                f.write(f"MaxMaterials {MXMATS}\n")
-            print("Wrote arraySizes.txt and exiting.")
-            sys.exit(0)
-
-        if filename.strip() == "":
-            filename = input("Enter the name of the Seep2D super file: ").strip()
-
-        if not os.path.exists(filename):
-            raise FileNotFoundError(f"Super file '{filename}' not found.")
-
-        with open(filename, "r") as f:
-            sptype = f.readline().strip()
-
-        if not sptype.startswith("SEEPSUP"):
-            raise ValueError("This file is not a GMS Seep2D superfile.")
-
-        print(f"Superfile validated: {filename}")
-
-        # Read associated data files
-        with open(filename, "r") as f:
-            lines = f.readlines()[1:]  # skip sptype line
-
-        for line in lines:
-            parts = line.strip().split()
-            if len(parts) < 2:
-                continue
-            fltype, flname = parts[0], parts[1]
-            flname = os.path.join(os.path.dirname(filename), flname)
-
-            if fltype == "SEEP":
-                self.seep_file = flname
-                print(f"SEEP file: {flname}")
-            elif fltype == "ODAT":
-                self.odat_file = flname
-                print(f"ODAT file: {flname}")
-            elif fltype == "OGEO":
-                self.ogeo_file = flname
-                self.usegeo = True
-                print(f"OGEO file: {flname}")
-            elif fltype == "DSET":
-                self.dset_file = flname
-                print(f"DSET file: {flname}")
-
-    def run_analysis(self):
-        """
-        Unified SEEP2D analysis driver for both confined and unconfined flow.
-        """
-        is_unconfined = np.any(self.nbc == 2)
-        flow_type = "unconfined" if is_unconfined else "confined"
-        print(f"Solving {flow_type.upper()} SEEP2D problem...")
-        print("Number of fixed-head nodes:", np.sum(self.nbc == 1))
-        print("Number of exit face nodes:", np.sum(self.nbc == 2))
-
-        # Dirichlet BCs: fixed head (nbc == 1) and possibly exit face (nbc == 2)
-        bcs = [(i, self.fx[i]) for i in range(len(self.nbc)) if self.nbc[i] in (1, 2)]
-
-        # Material properties (per element)
-        mat_ids = self.element_materials - 1
-        k1 = self.k1_by_mat[mat_ids]
-        k2 = self.k2_by_mat[mat_ids]
-        angle = self.angle_by_mat[mat_ids]
-
-        # Solve for head, stiffness matrix A, and nodal flow vector q
-        if is_unconfined:
-            # Get kr0 and h0 values per element based on material
-            kr0_per_element = self.kr0_by_mat[mat_ids]
-            h0_per_element = self.h0_by_mat[mat_ids]
-
-            head, A, q, total_flow = solve_unsaturated(
-                coords=self.coords,
-                elements=self.elements,
-                nbc=self.nbc,
-                fx=self.fx,
-                kr0=kr0_per_element,
-                h0=h0_per_element,
-                k1_vals=k1,
-                k2_vals=k2,
-                angles=angle,
-                max_iter=200,
-                tol=1e-4
-            )
-            # Solve for potential function φ for flow lines
-            dirichlet_phi_bcs = create_flow_potential_bc(self.coords, self.elements, q)
-            phi = solve_flow_function_unsaturated(self.coords, self.elements, head, k1, k2, angle, kr0_per_element, h0_per_element, dirichlet_phi_bcs)
-            print(f"phi min: {np.min(phi):.3f}, max: {np.max(phi):.3f}")
-            # Compute velocity, pass element-level kr0 and h0
-            velocity = compute_velocity(self.coords, self.elements, head, k1, k2, angle, kr0_per_element, h0_per_element)
-        else:
-            head, A, q, total_flow = solve_confined(self.coords, self.elements, self.nbc, bcs, k1, k2, angle)
-            # Solve for potential function φ for flow lines
-            dirichlet_phi_bcs = create_flow_potential_bc(self.coords, self.elements, q)
-            phi = solve_flow_function_confined(self.coords, self.elements, k1, k2, angle, dirichlet_phi_bcs)
-            print(f"phi min: {np.min(phi):.3f}, max: {np.max(phi):.3f}")
-            # Compute velocity, don't pass kr0 and h0
-            velocity = compute_velocity(self.coords, self.elements, head, k1, k2, angle)
-
-        gamma_w = self.unit_weight
-        pressure = gamma_w * (head - self.coords[:, 1])
-
-        self.solution = {
-            "head": head,
-            "pressure": pressure,
-            "velocity": velocity,
-            "q": q,
-            "phi": phi,
-            "flowrate": total_flow
-        }
-
-        if hasattr(self, "export_path"):
-            export_solution_csv(self.export_path, self.coords, head, pressure, velocity, q, phi, total_flow)
-
-        # After computing nodal flows
-        #debug_nodal_flows_above_phreatic(self.coords, head, q, title='Nodal Flows vs Phreatic Surface')
-
-    def save_results(self, filename):
-        print(f"Saving results to {filename}")
-        # TODO: Implement result writer
-
-
-def main():
-    model = Seep2D()
-    model.load_input("input.seep")
-    model.run_analysis()
-    model.save_results("results.out")
-
-
-    if __name__ == "__main__":
-        main()
-
-    import re
-    import numpy as np
-
-    element_lines = lines[skip_header + num_nodes:]
-    elements = []
-    mat_ids = []
-
-    for line in element_lines:
-        nums = [int(n) for n in re.findall(r'\d+', line)]
-        if len(nums) >= 6:
-            _, n1, n2, n3, _, mat = nums[:6]
-            elements.append([n1, n2, n3])
-            mat_ids.append(mat)
-
-    return np.array(elements) - 1, np.array(mat_ids)  # zero-based indexing
-
-def read_seep2d_input(filepath):
+def import_seep2d(filepath):
     """
     Reads SEEP2D .s2d input file and returns mesh, materials, and BC data.
 
@@ -204,7 +9,6 @@ def read_seep2d_input(filepath):
         {
             "coords": np.ndarray (n_nodes, 2),
             "node_ids": np.ndarray (n_nodes,),
-            "node_materials": np.ndarray (n_nodes,),
             "nbc": np.ndarray (n_nodes,),   # boundary condition flags
             "fx": np.ndarray (n_nodes,),    # boundary condition values (head or elevation)
             "elements": np.ndarray (n_elements, 3),
@@ -253,7 +57,6 @@ def read_seep2d_input(filepath):
     element_lines = lines[line_offset + num_nodes:]
 
     coords = []
-    node_materials = []
     node_ids = []
     nbc_flags = []
     fx_vals = []
@@ -276,7 +79,6 @@ def read_seep2d_input(filepath):
             nbc_flags.append(bc_type)
             fx_vals.append(fx_val)
             coords.append((x, y))
-            node_materials.append(0)
 
         except Exception as e:
             print(f"Warning: skipping node due to error: {e}")
@@ -294,7 +96,6 @@ def read_seep2d_input(filepath):
     return {
         "coords": np.array(coords),
         "node_ids": np.array(node_ids, dtype=int),
-        "node_materials": np.array(node_materials),
         "nbc": np.array(nbc_flags, dtype=int),
         "fx": np.array(fx_vals),
         "elements": np.array(elements, dtype=int) - 1,
@@ -307,36 +108,6 @@ def read_seep2d_input(filepath):
         "unit_weight": unit_weight
     }
 
-def export_solution_csv(filename, coords, head, pressure, velocity, q, phi, flowrate):
-    """Exports nodal results to a CSV file."""
-    import pandas as pd
-    df = pd.DataFrame({
-        "x": coords[:, 0],
-        "y": coords[:, 1],
-        "head": head,
-        "pressure": pressure,
-        "v_x": velocity[:, 0],
-        "v_y": velocity[:, 1],
-        "v_mag": np.linalg.norm(velocity, axis=1),
-        "q": q,
-        "phi": phi
-    })
-    # Write to file, then append flowrate as comment
-    with open(filename, "w") as f:
-        df.to_csv(f, index=False)
-        f.write(f"# Total Flowrate: {flowrate:.6f}\n")
-
-    print(f"Exported solution to {filename}")
-
-def load_solution_csv(filename):
-    """Loads solution results from a CSV file."""
-    import pandas as pd
-    df = pd.read_csv(filename)
-    coords = df[["x", "y"]].values
-    head = df["head"].values
-    pressure = df["pressure"].values
-    velocity = df[["vx", "vy"]].values
-    return coords, head, pressure, velocity
 
 
 def solve_confined(coords, elements, nbc, dirichlet_bcs, k1_vals, k2_vals, angles=None):
@@ -1056,4 +827,189 @@ def compute_velocity(coords, elements, head, k1_vals, k2_vals, angles, kr0=None,
     count[count == 0] = 1  # Avoid division by zero
     velocity /= count[:, None]
     return velocity
+
+def run_analysis(seep_data):
+    """
+    Standalone function to run seepage analysis.
+    
+    Args:
+        seep_data: Dictionary containing all the seepage data 
+    
+    Returns:
+        Dictionary containing solution results
+    """
+    # Extract data from seep_data
+    coords = seep_data["coords"]
+    elements = seep_data["elements"]
+    nbc = seep_data["nbc"]
+    fx = seep_data["fx"]
+    element_materials = seep_data["element_materials"]
+    k1_by_mat = seep_data["k1_by_mat"]
+    k2_by_mat = seep_data["k2_by_mat"]
+    angle_by_mat = seep_data["angle_by_mat"]
+    kr0_by_mat = seep_data["kr0_by_mat"]
+    h0_by_mat = seep_data["h0_by_mat"]
+    unit_weight = seep_data["unit_weight"]
+    
+    # Determine if unconfined flow
+    is_unconfined = np.any(nbc == 2)
+    flow_type = "unconfined" if is_unconfined else "confined"
+    print(f"Solving {flow_type.upper()} seepage problem...")
+    print("Number of fixed-head nodes:", np.sum(nbc == 1))
+    print("Number of exit face nodes:", np.sum(nbc == 2))
+
+    # Dirichlet BCs: fixed head (nbc == 1) and possibly exit face (nbc == 2)
+    bcs = [(i, fx[i]) for i in range(len(nbc)) if nbc[i] in (1, 2)]
+
+    # Material properties (per element)
+    mat_ids = element_materials - 1
+    k1 = k1_by_mat[mat_ids]
+    k2 = k2_by_mat[mat_ids]
+    angle = angle_by_mat[mat_ids]
+
+    # Solve for head, stiffness matrix A, and nodal flow vector q
+    if is_unconfined:
+        # Get kr0 and h0 values per element based on material
+        kr0_per_element = kr0_by_mat[mat_ids]
+        h0_per_element = h0_by_mat[mat_ids]
+
+        head, A, q, total_flow = solve_unsaturated(
+            coords=coords,
+            elements=elements,
+            nbc=nbc,
+            fx=fx,
+            kr0=kr0_per_element,
+            h0=h0_per_element,
+            k1_vals=k1,
+            k2_vals=k2,
+            angles=angle,
+            max_iter=200,
+            tol=1e-4
+        )
+        # Solve for potential function φ for flow lines
+        dirichlet_phi_bcs = create_flow_potential_bc(coords, elements, q)
+        phi = solve_flow_function_unsaturated(coords, elements, head, k1, k2, angle, kr0_per_element, h0_per_element, dirichlet_phi_bcs)
+        print(f"phi min: {np.min(phi):.3f}, max: {np.max(phi):.3f}")
+        # Compute velocity, pass element-level kr0 and h0
+        velocity = compute_velocity(coords, elements, head, k1, k2, angle, kr0_per_element, h0_per_element)
+    else:
+        head, A, q, total_flow = solve_confined(coords, elements, nbc, bcs, k1, k2, angle)
+        # Solve for potential function φ for flow lines
+        dirichlet_phi_bcs = create_flow_potential_bc(coords, elements, q)
+        phi = solve_flow_function_confined(coords, elements, k1, k2, angle, dirichlet_phi_bcs)
+        print(f"phi min: {np.min(phi):.3f}, max: {np.max(phi):.3f}")
+        # Compute velocity, don't pass kr0 and h0
+        velocity = compute_velocity(coords, elements, head, k1, k2, angle)
+
+    gamma_w = unit_weight
+    u = gamma_w * (head - coords[:, 1])
+
+    solution = {
+        "head": head,
+        "u": u,
+        "velocity": velocity,
+        "q": q,
+        "phi": phi,
+        "flowrate": total_flow
+    }
+
+    return solution
+
+def export_solution_csv(filename, seep_data, solution):
+    """Exports nodal results to a CSV file.
+    
+    Args:
+        filename: Path to the output CSV file
+        seep_data: Dictionary containing seepage data 
+        solution: Dictionary containing solution results from run_analysis
+    """
+    import pandas as pd
+    df = pd.DataFrame({
+        "node_id": seep_data["node_ids"],
+        "head": solution["head"],
+        "u": solution["u"],
+        "v_x": solution["velocity"][:, 0],
+        "v_y": solution["velocity"][:, 1],
+        "v_mag": np.linalg.norm(solution["velocity"], axis=1),
+        "q": solution["q"],
+        "phi": solution["phi"]
+    })
+    # Write to file, then append flowrate as comment
+    with open(filename, "w") as f:
+        df.to_csv(f, index=False)
+        f.write(f"# Total Flowrate: {solution['flowrate']:.6f}\n")
+
+    print(f"Exported solution to {filename}")
+
+def print_seep_data_diagnostics(seep_data):
+    """
+    Diagnostic function to print out the contents of seep_data after loading.
+    
+    Args:
+        seep_data: Dictionary containing seepage data 
+    """
+    print("\n" + "="*60)
+    print("SEEP DATA DIAGNOSTICS")
+    print("="*60)
+    
+    # Basic problem information
+    print(f"Number of nodes: {len(seep_data['coords'])}")
+    print(f"Number of elements: {len(seep_data['elements'])}")
+    print(f"Number of materials: {len(seep_data['k1_by_mat'])}")
+    print(f"Unit weight of water: {seep_data['unit_weight']}")
+    
+    # Coordinate ranges
+    coords = seep_data['coords']
+    print(f"\nCoordinate ranges:")
+    print(f"  X: {coords[:, 0].min():.3f} to {coords[:, 0].max():.3f}")
+    print(f"  Y: {coords[:, 1].min():.3f} to {coords[:, 1].max():.3f}")
+    
+    # Boundary conditions
+    nbc = seep_data['nbc']
+    fx = seep_data['fx']
+    print(f"\nBoundary conditions:")
+    print(f"  Fixed head nodes (nbc=1): {np.sum(nbc == 1)}")
+    print(f"  Exit face nodes (nbc=2): {np.sum(nbc == 2)}")
+    print(f"  Free nodes (nbc=0): {np.sum(nbc == 0)}")
+    
+    if np.sum(nbc == 1) > 0:
+        fixed_head_nodes = np.where(nbc == 1)[0]
+        print(f"  Fixed head values: {fx[fixed_head_nodes]}")
+    
+    if np.sum(nbc == 2) > 0:
+        exit_face_nodes = np.where(nbc == 2)[0]
+        print(f"  Exit face elevations: {fx[exit_face_nodes]}")
+    
+    # Material properties
+    print(f"\nMaterial properties:")
+    for i in range(len(seep_data['k1_by_mat'])):
+        print(f"  Material {i+1}:")
+        print(f"    k1 (major conductivity): {seep_data['k1_by_mat'][i]:.6f}")
+        print(f"    k2 (minor conductivity): {seep_data['k2_by_mat'][i]:.6f}")
+        print(f"    angle (degrees): {seep_data['angle_by_mat'][i]:.1f}")
+        print(f"    kr0 (relative conductivity): {seep_data['kr0_by_mat'][i]:.6f}")
+        print(f"    h0 (suction head): {seep_data['h0_by_mat'][i]:.3f}")
+    
+    # Element material distribution
+    element_materials = seep_data['element_materials']
+    unique_materials, counts = np.unique(element_materials, return_counts=True)
+    print(f"\nElement material distribution:")
+    for mat_id, count in zip(unique_materials, counts):
+        print(f"  Material {mat_id}: {count} elements")
+    
+    # Check for potential issues
+    print(f"\nData validation:")
+    if np.any(seep_data['k1_by_mat'] <= 0):
+        print("  WARNING: Some k1 values are <= 0")
+    if np.any(seep_data['k2_by_mat'] <= 0):
+        print("  WARNING: Some k2 values are <= 0")
+    if np.any(seep_data['k1_by_mat'] < seep_data['k2_by_mat']):
+        print("  WARNING: Some k1 values are less than k2 (should be major >= minor)")
+    
+    # Flow type determination
+    is_unconfined = np.any(nbc == 2)
+    flow_type = "unconfined" if is_unconfined else "confined"
+    print(f"  Flow type: {flow_type}")
+    
+    print("="*60 + "\n")
 
