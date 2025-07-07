@@ -4,7 +4,7 @@ from matplotlib.ticker import MaxNLocator
 import numpy as np
 
 
-def plot_mesh(seep_data, show_nodes=False, show_bc=False):
+def plot_seep_mesh(seep_data, show_nodes=False, show_bc=False):
     """
     Plots a mesh colored by material zone.
     
@@ -64,7 +64,7 @@ def plot_mesh(seep_data, show_nodes=False, show_bc=False):
     plt.show()
 
 
-def plot_solution(seep_data, solution, levels=20, base_mat=None, fill_contours=True, phreatic=True):
+def plot_seep_solution(seep_data, solution, levels=20, base_mat=None, fill_contours=True, phreatic=True):
     """
     Plots head contours and optionally overlays flowlines (phi) based on flow function.
     Fixed version that properly handles mesh aspect ratio and doesn't clip the plot.
@@ -166,7 +166,7 @@ def plot_solution(seep_data, solution, levels=20, base_mat=None, fill_contours=T
 
     # Plot the mesh boundary
     try:
-        boundary = get_ordered_boundary(coords, elements)
+        boundary = get_ordered_mesh_boundary(coords, elements)
         ax.plot(boundary[:, 0], boundary[:, 1], color="black", linewidth=1.0, label="Mesh Boundary")
     except Exception as e:
         print(f"Warning: Could not plot mesh boundary: {e}")
@@ -195,7 +195,7 @@ def plot_solution(seep_data, solution, levels=20, base_mat=None, fill_contours=T
     plt.tight_layout()
     plt.show()
 
-def get_ordered_boundary(coords, elements):
+def get_ordered_mesh_boundary(coords, elements):
     """
     Extracts the outer boundary of the mesh and returns it as an ordered array of points.
 

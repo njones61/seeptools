@@ -1,5 +1,9 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
+from scipy.sparse import lil_matrix, csr_matrix
+from scipy.sparse.linalg import spsolve
+
 
 def import_seep2d(filepath):
     """
@@ -16,7 +20,6 @@ def import_seep2d(filepath):
         }
     """
     import re
-    import numpy as np
 
     with open(filepath, "r", encoding="latin-1") as f:
         lines = [line.rstrip() for line in f if line.strip()]
@@ -109,7 +112,6 @@ def import_seep2d(filepath):
     }
 
 
-
 def solve_confined(coords, elements, nbc, dirichlet_bcs, k1_vals, k2_vals, angles=None):
     """
     FEM solver for confined seepage with anisotropic conductivity.
@@ -123,9 +125,8 @@ def solve_confined(coords, elements, nbc, dirichlet_bcs, k1_vals, k2_vals, angle
     Returns:
         head : (n_nodes,) array of nodal heads
     """
-    import numpy as np
-    from scipy.sparse import lil_matrix
-    from scipy.sparse.linalg import spsolve
+
+
 
     n_nodes = coords.shape[0]
     A = lil_matrix((n_nodes, n_nodes))
@@ -161,8 +162,6 @@ def solve_confined(coords, elements, nbc, dirichlet_bcs, k1_vals, k2_vals, angle
             for b_ in range(3):
                 A[tri[a], tri[b_]] += ke[a, b_]
 
-    from scipy.sparse import csr_matrix
-
     A_full = A.copy()  # Keep original matrix for computing q
 
     for node, value in dirichlet_bcs:
@@ -189,9 +188,7 @@ def solve_unsaturated(coords, elements, nbc, fx, kr0=0.001, h0=-1.0,
     """
     Iterative FEM solver for unconfined flow using linear kr frontal function.
     """
-    import numpy as np
-    from scipy.sparse import lil_matrix, csr_matrix
-    from scipy.sparse.linalg import spsolve
+
 
     n_nodes = coords.shape[0]
     y = coords[:, 1]
@@ -424,7 +421,6 @@ def diagnose_exit_face(coords, nbc, h, q, fx):
     """
     Diagnostic function to understand exit face behavior
     """
-    import numpy as np
 
     print("\n=== Exit Face Diagnostics ===")
     exit_nodes = np.where(nbc == 2)[0]
@@ -482,7 +478,7 @@ def create_flow_potential_bc(coords, elements, q, debug=False):
     Returns:
         List of (node_id, phi_value) tuples
     """
-    import numpy as np
+
     from collections import defaultdict
 
     if debug:
@@ -643,10 +639,6 @@ def solve_flow_function_confined(coords, elements, k1_vals, k2_vals, angles, dir
         phi : (n_nodes,) stream function (flow function) values
     """
 
-    from scipy.sparse import lil_matrix
-    from scipy.sparse.linalg import spsolve
-    import numpy as np
-
     n_nodes = coords.shape[0]
     A = lil_matrix((n_nodes, n_nodes))
     b = np.zeros(n_nodes)
@@ -695,9 +687,6 @@ def solve_flow_function_unsaturated(coords, elements, head, k1_vals, k2_vals, an
     Solves the flow function Phi using the correct ke for unsaturated flow.
     For flowlines, assemble the element matrix using the inverse of kr_elem and Kmat, matching the FORTRAN logic.
     """
-    from scipy.sparse import lil_matrix
-    from scipy.sparse.linalg import spsolve
-    import numpy as np
 
     n_nodes = coords.shape[0]
     A = lil_matrix((n_nodes, n_nodes))
